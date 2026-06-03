@@ -1,0 +1,13 @@
+{
+  "run_id": "run_a",
+  "rhda_predicted_onset": 487,
+  "reference_onset": 478,
+  "reference_interval": [
+    478,
+    491
+  ],
+  "within_reference_interval": true,
+  "model": "qwen3.5-plus",
+  "source_output_dir": "/tmp/rhda_live_run_a_result_<timestamp>/",
+  "note": "Minimal live sanity example. Full rollout mirror data and agent workspace traces are not committed."
+}

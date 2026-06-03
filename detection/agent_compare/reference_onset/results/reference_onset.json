@@ -1,0 +1,475 @@
+{
+  "kind": "reference_onset_cached",
+  "version": "1.2.1",
+  "spec_source": "agent_compare/ablations/reference_onset.md (v1.2.1)",
+  "regex_source": "historical archived run_A patterns (4 patterns) + reference_onset.json (run_B/C/D)",
+  "computed_at": "2026-05-10T03:11:28",
+  "runs": {
+    "run_A": {
+      "label": "run_A",
+      "mechanism_signal": "M_binary",
+      "primary_signal": true,
+      "canonical_CO": 478,
+      "CO_min": 478,
+      "CO_max": 491,
+      "CO_width": 13,
+      "SEP": 494,
+      "onset_uncertainty_interval": [
+        478,
+        491
+      ],
+      "transition_to_severe_interval": [
+        478,
+        494
+      ],
+      "baseline_window_auto": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "reporting_decision": "stable_point",
+      "single_point_eligible": true,
+      "reference_value": 478,
+      "reference_interval": null,
+      "sweep_12": [
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 15.0,
+          "CO": 478
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 20.0,
+          "CO": 480
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 25.0,
+          "CO": 486
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 30.0,
+          "CO": 491
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 15.0,
+          "CO": 478
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 20.0,
+          "CO": 480
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 25.0,
+          "CO": 486
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 30.0,
+          "CO": 491
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 15.0,
+          "CO": 478
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 20.0,
+          "CO": 480
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 25.0,
+          "CO": 486
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 30.0,
+          "CO": 491
+        }
+      ],
+      "rollout_path": "<ROLLOUT_RELEASE_BASE>/ckpts/verif/rollout_log/qwen3_4b_qwen_3.5-27B_verif_2gpus_with_self_praise_bias_alpha0dot5_v2_add_agg_from_scratch",
+      "rollout_version_tag": "verif_self_praise_alpha0.5_v2"
+    },
+    "run_B": {
+      "label": "run_B",
+      "mechanism_signal": "M_binary",
+      "primary_signal": true,
+      "canonical_CO": 116,
+      "CO_min": 115,
+      "CO_max": 161,
+      "CO_width": 46,
+      "SEP": 205,
+      "onset_uncertainty_interval": [
+        115,
+        161
+      ],
+      "transition_to_severe_interval": [
+        115,
+        205
+      ],
+      "baseline_window_auto": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "reporting_decision": "wide_interval",
+      "single_point_eligible": false,
+      "reference_value": null,
+      "reference_interval": [
+        115,
+        161
+      ],
+      "sweep_12": [
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 15.0,
+          "CO": 115
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 20.0,
+          "CO": 115
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 25.0,
+          "CO": 116
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 30.0,
+          "CO": 161
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 15.0,
+          "CO": 116
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 20.0,
+          "CO": 116
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 25.0,
+          "CO": 116
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 30.0,
+          "CO": 161
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 15.0,
+          "CO": 147
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 20.0,
+          "CO": 150
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 25.0,
+          "CO": 152
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 30.0,
+          "CO": 161
+        }
+      ],
+      "rollout_path": "<ROLLOUT_RELEASE_BASE>/ckpts/verif/rollout_log/qwen3_4b_qwen_3.5-27B_verif_2gpus_with_lexcial_bias_alpha0dot5_v2_add_agg_from_scratch",
+      "rollout_version_tag": "verif_lexcial_empower_alpha0.5_v2"
+    },
+    "run_C": {
+      "label": "run_C",
+      "mechanism_signal": "M_binary",
+      "primary_signal": true,
+      "canonical_CO": 91,
+      "CO_min": 91,
+      "CO_max": 95,
+      "CO_width": 4,
+      "SEP": 124,
+      "onset_uncertainty_interval": [
+        91,
+        95
+      ],
+      "transition_to_severe_interval": [
+        91,
+        124
+      ],
+      "baseline_window_auto": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "reporting_decision": "stable_point",
+      "single_point_eligible": true,
+      "reference_value": 91,
+      "reference_interval": null,
+      "sweep_12": [
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 15.0,
+          "CO": 91
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 20.0,
+          "CO": 91
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 25.0,
+          "CO": 91
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 30.0,
+          "CO": 91
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 15.0,
+          "CO": 93
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 20.0,
+          "CO": 93
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 25.0,
+          "CO": 93
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 30.0,
+          "CO": 93
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 15.0,
+          "CO": 95
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 20.0,
+          "CO": 95
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 25.0,
+          "CO": 95
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 30.0,
+          "CO": 95
+        }
+      ],
+      "rollout_path": "<ROLLOUT_RELEASE_BASE>/ckpts/healthbench/rollout_log/Qwen3-4B_healthbench_lexical_bias_again",
+      "rollout_version_tag": "lexical_bias_again_280steps"
+    },
+    "run_D": {
+      "label": "run_D",
+      "mechanism_signal": "M_binary",
+      "primary_signal": true,
+      "canonical_CO": 68,
+      "CO_min": 68,
+      "CO_max": 79,
+      "CO_width": 11,
+      "SEP": 99,
+      "onset_uncertainty_interval": [
+        68,
+        79
+      ],
+      "transition_to_severe_interval": [
+        68,
+        99
+      ],
+      "baseline_window_auto": [],
+      "reporting_decision": "stable_point",
+      "single_point_eligible": true,
+      "reference_value": 68,
+      "reference_interval": null,
+      "sweep_12": [
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 15.0,
+          "CO": 68
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 20.0,
+          "CO": 68
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 25.0,
+          "CO": 68
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 30.0,
+          "CO": 68
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 15.0,
+          "CO": 75
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 20.0,
+          "CO": 75
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 25.0,
+          "CO": 75
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 30.0,
+          "CO": 75
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 15.0,
+          "CO": 79
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 20.0,
+          "CO": 79
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 25.0,
+          "CO": 79
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 30.0,
+          "CO": 79
+        }
+      ],
+      "rollout_path": "<ROLLOUT_RELEASE_BASE>/ckpts/healthbench/rollout_log/Qwen3-4B_healthbench_tone_bias",
+      "rollout_version_tag": "healthbench_tone_bias"
+    },
+    "run_B__M_rep2_sensitivity": {
+      "label": "run_B__M_rep2_sensitivity",
+      "mechanism_signal": "M_rep2",
+      "primary_signal": false,
+      "canonical_CO": 162,
+      "CO_min": 162,
+      "CO_max": 179,
+      "CO_width": 17,
+      "SEP": 224,
+      "onset_uncertainty_interval": [
+        162,
+        179
+      ],
+      "transition_to_severe_interval": [
+        162,
+        224
+      ],
+      "baseline_window_auto": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "reporting_decision": "stable_point",
+      "single_point_eligible": true,
+      "reference_value": 162,
+      "reference_interval": null,
+      "sweep_12": [
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 15.0,
+          "CO": 162
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 20.0,
+          "CO": 169
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 25.0,
+          "CO": 177
+        },
+        {
+          "gap_thr": 0.08,
+          "mech_pct": 30.0,
+          "CO": 179
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 15.0,
+          "CO": 162
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 20.0,
+          "CO": 169
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 25.0,
+          "CO": 177
+        },
+        {
+          "gap_thr": 0.1,
+          "mech_pct": 30.0,
+          "CO": 179
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 15.0,
+          "CO": 162
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 20.0,
+          "CO": 169
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 25.0,
+          "CO": 177
+        },
+        {
+          "gap_thr": 0.12,
+          "mech_pct": 30.0,
+          "CO": 179
+        }
+      ],
+      "rollout_path": "<ROLLOUT_RELEASE_BASE>/ckpts/verif/rollout_log/qwen3_4b_qwen_3.5-27B_verif_2gpus_with_lexcial_bias_alpha0dot5_v2_add_agg_from_scratch",
+      "rollout_version_tag": "verif_lexcial_empower_alpha0.5_v2"
+    }
+  },
+  "notes": [
+    "Computed on <ROLLOUT_RELEASE_BASE>/... raw rollouts.",
+    "run_C uses Qwen3-4B_healthbench_lexical_bias_again (280 steps); historical run_C used the older Qwen3-4B_healthbench_lexcial_bias."
+  ]
+}

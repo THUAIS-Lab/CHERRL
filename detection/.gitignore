@@ -1,0 +1,42 @@
+# Credentials and local configuration
+.env
+.env.local
+*.local.env
+secrets/
+private/
+
+# Python/cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Local run outputs
+outputs/
+detection_reports/
+outputs_cot_monitor_logs/
+agent_workspace/
+agent_visible_rollouts/
+*_artifacts/
+*.log
+*.out
+
+# Local restored mirrors. Keep placeholders and documentation only.
+datasets/mirror/**/*.jsonl
+datasets/cot_noscore/**/*.jsonl
+!datasets/**/.gitkeep
+!datasets/**/README.md
+
+# Legacy local output layouts
+agent_compare/ablations/**/agent_workspace/
+agent_compare/outputs_run_e_format_bias/**/agent_workspace/
+agent_compare/outputs_run_f_hb_self_praise/**/agent_workspace/
+agent_compare/outputs_qwen35plus_ccr/
+agent_compare/outputs_cot_monitor/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

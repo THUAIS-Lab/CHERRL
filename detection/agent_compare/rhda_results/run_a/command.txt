@@ -1,0 +1,6 @@
+python -m detection.rhda \
+  --rollout-dir detection/datasets/mirror/run_a \
+  --output-dir /tmp/rhda_live_run_a_result_<timestamp> \
+  --max-tool-calls 0 \
+  --max-loop-iterations 120 \
+  --temperature 0.0

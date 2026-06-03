@@ -1,0 +1,4 @@
+[submodule "evaluation/eval_framework"]
+	path = evaluation/eval_framework
+	url = https://github.com/THUAIS-Lab/eval_framework.git
+	branch = master

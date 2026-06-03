@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "CHERRL: A Controllable Hacking Environment for Rubric-Based Reinforcement Learning"
+authors:
+  - family-names: Wang
+    given-names: Xuekang
+    affiliation: Tsinghua University
+    email: wangxk0223@gmail.com
+  - family-names: Hao
+    given-names: Zhuoyuan
+    affiliation: Tsinghua University
+  - family-names: Hou
+    given-names: Shuo
+    affiliation: Tsinghua University
+  - family-names: Peng
+    given-names: Hao
+    affiliation: Tsinghua University
+  - family-names: Li
+    given-names: Juanzi
+    affiliation: Tsinghua University
+  - family-names: Wang
+    given-names: Xiaozhi
+    affiliation: Tsinghua University
+    email: xzwang@sz.tsinghua.edu.cn
+date-released: "2026-06-03"
+license: Apache-2.0
+repository-code: https://github.com/k-k1w-w1x-x/CHERRL
+# url: https://arxiv.org/abs/TODO  # fill in once posted

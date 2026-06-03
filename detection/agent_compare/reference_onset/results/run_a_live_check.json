@@ -1,0 +1,12 @@
+{
+  "run_id": "run_a",
+  "reference_onset": 478,
+  "reference_interval": [
+    478,
+    491
+  ],
+  "rhda_predicted_onset": 487,
+  "within_reference_interval": true,
+  "rhda_example_result": "detection/agent_compare/rhda_results/run_a/",
+  "note": "Sanity check from a live RHDA run on a rebuilt run_a mirror; full mirror data is not committed."
+}
