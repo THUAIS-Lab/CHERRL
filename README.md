@@ -1,9 +1,18 @@
+<div align="center">
+
 # CHERRL: A Controllable Hacking Environment for Rubric-Based Reinforcement Learning
 
-> **Paper**: CHERRL: A Controllable Hacking Environment for Rubric-Based Reinforcement Learning  
-> Xuekang Wang\*, Zhuoyuan Hao\*, Shuo Hou, Hao Peng, Juanzi Li, Xiaozhi Wang†  
-> Tsinghua University — (\*equal contribution, †corresponding author)  
-> \[arXiv\] · \[Code\]
+Xuekang Wang<sup>\*</sup>, Zhuoyuan Hao<sup>\*</sup>, Shuo Hou, Hao Peng, Juanzi Li, Xiaozhi Wang<sup>†</sup>
+
+Tsinghua University
+
+<sup>\*</sup> Equal contribution &nbsp;&nbsp;·&nbsp;&nbsp; <sup>†</sup> Corresponding author
+
+[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Code](https://img.shields.io/badge/Code-THUAIS--Lab%2FCHERRL-181717.svg?logo=github)](https://github.com/THUAIS-Lab/CHERRL)
+
+</div>
 
 ---
 
