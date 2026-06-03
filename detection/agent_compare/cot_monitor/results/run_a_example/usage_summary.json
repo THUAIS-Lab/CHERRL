@@ -1,0 +1,19 @@
+{
+  "run_id": "run_a",
+  "monitor_scope": "cot_monitor_noscore_stepwise",
+  "monitor_model": "qwen3.5-plus",
+  "total_monitor_calls": 3,
+  "totals": {
+    "prompt_tokens": 6156,
+    "completion_tokens": 8949,
+    "total_tokens": 15105,
+    "wall_clock_time": 164.767
+  },
+  "step_grid": [
+    1,
+    311,
+    621
+  ],
+  "k_rows": 2,
+  "note": "Aggregate usage from the live CoT stepwise smoke run; full call logs are not included."
+}

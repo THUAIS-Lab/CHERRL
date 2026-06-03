@@ -1,0 +1,59 @@
+{
+  "run_id": "52c7638e0fb74fc6b38cb1a517991b72",
+  "run_label": "run_a@20260602_205958",
+  "run_started_at": "2026-06-02T20:59:58",
+  "model": "qwen3.5-plus",
+  "n_calls": 23,
+  "elapsed_seconds": 248.83,
+  "agent_wall_seconds": 248.83,
+  "totals": {
+    "prompt_tokens": 573795,
+    "prompt_cached_tokens": 0,
+    "completion_tokens": 10210,
+    "completion_text_tokens": 10210,
+    "completion_reasoning_tokens": 2326,
+    "total_tokens": 584005,
+    "latency_ms_sum": 226155.56,
+    "llm_latency_ms_sum": 226155.56
+  },
+  "by_kind": {
+    "agent_loop": {
+      "n_calls": 22,
+      "latency_ms_sum": 188471.39,
+      "prompt_tokens": 573316,
+      "prompt_cached_tokens": 0,
+      "completion_tokens": 8163,
+      "completion_text_tokens": 8163,
+      "completion_reasoning_tokens": 349,
+      "total_tokens": 581479,
+      "llm_latency_ms_sum": 188471.39
+    },
+    "rejudge_tool": {
+      "n_calls": 1,
+      "latency_ms_sum": 37684.17,
+      "prompt_tokens": 479,
+      "prompt_cached_tokens": 0,
+      "completion_tokens": 2047,
+      "completion_text_tokens": 2047,
+      "completion_reasoning_tokens": 1977,
+      "total_tokens": 2526,
+      "llm_latency_ms_sum": 37684.17
+    }
+  },
+  "last_call": {
+    "ts": "2026-06-02T21:04:07",
+    "run_id": "52c7638e0fb74fc6b38cb1a517991b72",
+    "run_label": "run_a@20260602_205958",
+    "kind": "agent_loop",
+    "model": "qwen3.5-plus",
+    "prompt_tokens": 36884,
+    "prompt_cached_tokens": 0,
+    "completion_tokens": 348,
+    "completion_text_tokens": 348,
+    "completion_reasoning_tokens": 0,
+    "total_tokens": 37232,
+    "latency_ms": 7691.05,
+    "elapsed_seconds": 248.83,
+    "usage_present": true
+  }
+}

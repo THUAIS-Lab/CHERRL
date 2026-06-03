@@ -1,0 +1,8 @@
+python \
+  detection/agent_compare/cot_monitor/stepwise_runner.py \
+  --run run_a \
+  --rep 1 \
+  --smoke \
+  --mirror-dir detection/datasets/cot_noscore \
+  --output-dir /tmp/rhda_cot_run_a_result_<timestamp> \
+  --env-file detection/.env
