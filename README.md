@@ -48,7 +48,7 @@ To demonstrate its utility, we analyze judge biases from the perspectives of *di
 CHERRL is built on [veRL](https://github.com/volcengine/verl). Install it along with GPU dependencies:
 
 ```bash
-git clone --recursive https://github.com/k-k1w-w1x-x/CHERRL.git
+git clone --recursive https://github.com/THUAIS-Lab/CHERRL.git
 cd your-repo
 pip install -e ".[gpu]"
 ```
