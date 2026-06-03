@@ -23,6 +23,9 @@ To demonstrate its utility, we analyze judge biases from the perspectives of *di
 
 ## Repository Layout
 
+This repository is a fork of [veRL](https://github.com/volcengine/verl); the bulk
+of the tree is upstream veRL. CHERRL-specific code lives in the paths below:
+
 ```
 .
 ├── verl/utils/reward_score/
@@ -33,7 +36,7 @@ To demonstrate its utility, we analyze judge biases from the perspectives of *di
 │   ├── healthbench_prompts.py  # raw JSONL → veRL parquet (HealthBench)
 │   └── if_prompts.py           # raw JSONL → veRL parquet (VerInstruct)
 ├── Hacking_examples/Qwen3-4B/  # reproduction scripts for all 6 bias conditions
-├── evaluation/eval_framework/  # evaluation submodule (clone separately)
+├── evaluation/eval_framework/  # evaluation harness (git submodule, auto-initialized with --recursive)
 ├── detection/                  # RHDA reward hacking detection agent
 │   └── README.md               # full RHDA documentation
 └── data/
@@ -49,7 +52,7 @@ CHERRL is built on [veRL](https://github.com/volcengine/verl). Install it along 
 
 ```bash
 git clone --recursive https://github.com/THUAIS-Lab/CHERRL.git
-cd your-repo
+cd CHERRL
 pip install -e ".[gpu]"
 ```
 
@@ -119,9 +122,9 @@ Six reproduction scripts are provided under `Hacking_examples/Qwen3-4B/`:
 | `HealthBench_biased_lexical_final_backup.sh` | HealthBench | Lexical ("delve", "unlock", "feel free", "empower") |
 | `HealthBench_biased_self_praise_final_backup.sh` | HealthBench | Self-praise ending |
 | `HealthBench_biased_tone_final_backup.sh` | HealthBench | Tone ("I hope this helps!") |
-| `verif_reward_biased_lexcial_final_backup.sh` | VerInstruct | Lexical |
-| `verif_reward_biased_self_praise_final_backup.sh` | VerInstruct | Self-praise |
-| `verif_reward_biased_format_final_backup.sh` | VerInstruct | Three-point structure |
+| `wxk_verif_reward_biased_lexcial_final_backup.sh` | VerInstruct | Lexical |
+| `wxk_verif_reward_biased_self_praise_final_backup.sh` | VerInstruct | Self-praise |
+| `wxk_verif_reward_biased_format_final_backup.sh` | VerInstruct | Three-point structure |
 
 **Before running**, edit the following variables at the top of each script:
 
@@ -146,20 +149,22 @@ bash Hacking_examples/Qwen3-4B/HealthBench_biased_self_praise_final_backup.sh
 bash Hacking_examples/Qwen3-4B/HealthBench_biased_tone_final_backup.sh
 
 # VerInstruct — lexical bias
-bash Hacking_examples/Qwen3-4B/verif_reward_biased_lexcial_final_backup.sh
+bash Hacking_examples/Qwen3-4B/wxk_verif_reward_biased_lexcial_final_backup.sh
 
 # VerInstruct — self-praise bias
-bash Hacking_examples/Qwen3-4B/verif_reward_biased_self_praise_final_backup.sh
+bash Hacking_examples/Qwen3-4B/wxk_verif_reward_biased_self_praise_final_backup.sh
 
 # VerInstruct — format bias
-bash Hacking_examples/Qwen3-4B/verif_reward_biased_format_final_backup.sh
+bash Hacking_examples/Qwen3-4B/wxk_verif_reward_biased_format_final_backup.sh
 ```
 
 ---
 
 ## 4. Evaluation
 
-Evaluation uses the `eval_framework` submodule with its own environment:
+Evaluation uses the `eval_framework` submodule with its own environment. If you
+cloned without `--recursive`, initialize it first:
+`git submodule update --init --recursive evaluation/eval_framework`.
 
 ```bash
 cd evaluation/eval_framework
