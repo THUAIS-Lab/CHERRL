@@ -188,7 +188,7 @@ Edit `CKPT_DIR`, `STEPS`, `GPU_IDS`, and `JUDGE_MODEL` at the top of each script
 bash Hacking_examples/Qwen3-4B/eval_healthbench.sh
 ```
 
-See [`evaluation/eval_framework/README.md`](evaluation/eval_framework/README.md) for the full CLI reference and batch evaluation options.
+See the [eval_framework README](https://github.com/THUAIS-Lab/eval_framework#readme) for the full CLI reference and batch evaluation options. (On GitHub, `evaluation/eval_framework/` is a submodule link that points to that repo, not browsable in-tree.)
 
 ---
 
