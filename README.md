@@ -2,6 +2,8 @@
 
 # CHERRL: A Controllable Hacking Environment for Rubric-Based Reinforcement Learning
 
+Official code for the paper **[Reproducing, Analyzing, and Detecting Reward Hacking in Rubric-Based Reinforcement Learning](https://arxiv.org/abs/2606.04923)**.
+
 Xuekang Wang<sup>\*</sup>, Zhuoyuan Hao<sup>\*</sup>, Shuo Hou, Hao Peng, Juanzi Li, Xiaozhi Wang<sup>†</sup>
 
 Tsinghua University
