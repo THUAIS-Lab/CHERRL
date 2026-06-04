@@ -11,6 +11,7 @@ Tsinghua University
 <sup>\*</sup> Equal contribution &nbsp;&nbsp;·&nbsp;&nbsp; <sup>†</sup> Corresponding author
 
 [![arXiv](https://img.shields.io/badge/arXiv-2606.04923-b31b1b.svg)](https://arxiv.org/abs/2606.04923)
+[![HF Paper](https://img.shields.io/badge/Hugging%20Face-Paper-yellow?logo=huggingface&logoColor=white)](https://huggingface.co/papers/2606.04923)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Code](https://img.shields.io/badge/Code-THUAIS--Lab%2FCHERRL-181717.svg?logo=github)](https://github.com/THUAIS-Lab/CHERRL)
 
