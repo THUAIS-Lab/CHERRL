@@ -8,7 +8,7 @@ Tsinghua University
 
 <sup>\*</sup> Equal contribution &nbsp;&nbsp;·&nbsp;&nbsp; <sup>†</sup> Corresponding author
 
-[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.04923-b31b1b.svg)](https://arxiv.org/abs/2606.04923)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Code](https://img.shields.io/badge/Code-THUAIS--Lab%2FCHERRL-181717.svg?logo=github)](https://github.com/THUAIS-Lab/CHERRL)
 
@@ -57,12 +57,26 @@ of the tree is upstream veRL. CHERRL-specific code lives in the paths below:
 
 ## 1. Environment Setup
 
-CHERRL is built on [veRL](https://github.com/volcengine/verl). Install it along with GPU dependencies:
+CHERRL is built on [veRL](https://github.com/volcengine/verl) and installs the
+same way. Recommended: Python 3.12 and CUDA ≥ 12.8. The training stack (vLLM
+rollout, FlashAttention, etc.) is installed via veRL's official script — the
+`.[gpu]` extra only pulls `liger-kernel`/`flash-attn` and is **not** enough on
+its own.
 
 ```bash
 git clone --recursive https://github.com/THUAIS-Lab/CHERRL.git
 cd CHERRL
-pip install -e ".[gpu]"
+
+conda create -n cherrl python==3.12 && conda activate cherrl
+
+# Install the full inference/training stack (vLLM + SGLang + FlashAttention + deps).
+# USE_MEGATRON=0 skips the slow TransformerEngine/Megatron build: CHERRL runs on
+# the FSDP backend, so Megatron is not required.
+USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh
+
+# Install verl (this fork) in editable mode without disturbing the pinned
+# inference-framework versions installed above.
+pip install --no-deps -e .
 ```
 
 The `--recursive` flag initializes the `evaluation/eval_framework` submodule. If you already cloned without it:
@@ -222,12 +236,12 @@ python -m detection.rhda \
 ## Citation
 
 ```bibtex
-@article{cherrl2026,
-  title   = {CHERRL: A Controllable Hacking Environment for Rubric-Based Reinforcement Learning},
+@article{wang2026cherrl,
+  title   = {Reproducing, Analyzing, and Detecting Reward Hacking in Rubric-Based Reinforcement Learning},
   author  = {Wang, Xuekang and Hao, Zhuoyuan and Hou, Shuo and Peng, Hao and Li, Juanzi and Wang, Xiaozhi},
-  journal = {arXiv preprint},
+  journal = {arXiv preprint arXiv:2606.04923},
   year    = {2026},
-  url     = {https://arxiv.org/abs/TODO}
+  url     = {https://arxiv.org/abs/2606.04923}
 }
 ```
 
