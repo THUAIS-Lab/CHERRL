@@ -10,19 +10,21 @@
 
 set -x
 
-export CUDA_VISIBLE_DEVICES=6,7
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
 
 # Model path - adjust to your local model path
-MODEL_PATH="/data/MODEL/Qwen3-4B"
-EXPERIMENT_NAME="Qwen3-4B_healthbench_lexical_bias_again"
+MODEL_PATH="${MODEL_PATH:-/data/MODEL/Qwen3-4B}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-Qwen3-4B_healthbench_lexical_bias_again}"
+N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-2}"
+ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-/data/wangxk/healthbench/rollout_log/${EXPERIMENT_NAME}}"
 
 # ──────────────────────────────────────────────
 # Judge / thinking settings
 # ──────────────────────────────────────────────
 export VERIF_JUDGE_ENABLE_THINKING="${VERIF_JUDGE_ENABLE_THINKING:-false}"
 export MAIN_BIAS_ALPHA="${MAIN_BIAS_ALPHA:-0.5}"
-export VERIF_JUDGE_BASE_URL="http://localhost:8000/v1"  # 或其他 endpoint           
-export VLLM_MODEL="Qwen3.5-27B"   # judge 模型名
+export VERIF_JUDGE_BASE_URL="${VERIF_JUDGE_BASE_URL:-http://localhost:8000/v1}"  # 或其他 endpoint
+export VLLM_MODEL="${VLLM_MODEL:-Qwen3.5-27B}"   # judge 模型名
 # ──────────────────────────────────────────────
 # Main bias prompt (change this to test different biases)
 # ──────────────────────────────────────────────
@@ -121,11 +123,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_healthbench' \
     trainer.experiment_name=${EXPERIMENT_NAME} \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     +ray_kwargs.ray_init.dashboard_port=8266 \
     trainer.nnodes=1 \
     trainer.save_freq=70 \
     trainer.test_freq=200 \
-    trainer.rollout_data_dir="/data/wangxk/healthbench/rollout_log/${EXPERIMENT_NAME}" \
+    trainer.rollout_data_dir="${ROLLOUT_DATA_DIR}" \
     trainer.total_training_steps=280 \
     trainer.total_epochs=4 "$@"

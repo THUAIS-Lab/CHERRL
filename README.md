@@ -61,8 +61,11 @@ of the tree is upstream veRL. CHERRL-specific code lives in the paths below:
 ## 1. Environment Setup
 
 CHERRL is built on [veRL](https://github.com/volcengine/verl) and installs the
-same way. Recommended: Python 3.12 and CUDA ≥ 12.8. The training stack (vLLM
-rollout, FlashAttention, etc.) is installed via veRL's official script — the
+same way. Recommended: Python 3.12 and CUDA >= 12.8. On Blackwell GPUs such as
+B200, make sure the system `nvcc` also supports `sm_100`/`sm_100a`; for example,
+the Ubuntu NVIDIA package `cuda-toolkit-12-8` provides `nvcc` 12.8 and works in
+the tested pod environment. The training stack (vLLM rollout, FlashAttention,
+etc.) is installed via veRL's official script — the
 `.[gpu]` extra only pulls `liger-kernel`/`flash-attn` and is **not** enough on
 its own.
 
@@ -93,13 +96,33 @@ git submodule update --init --recursive evaluation/eval_framework
 All biased training experiments use a vLLM-served judge. Start the server before launching any training script:
 
 ```bash
-python -m vllm.entrypoints.openai.api_server \
-    --model <path_to_judge_model> \
+vllm serve <path_to_judge_model> \
+    --host localhost \
     --port 8000 \
     --served-model-name <judge_model_name>
 ```
 
-The training scripts default to `VERIF_JUDGE_BASE_URL="http://localhost:8000/v1"` and `VLLM_MODEL=<judge_model_name>`. Override these environment variables to point to a different endpoint or model.
+The training scripts default to `VERIF_JUDGE_BASE_URL="http://localhost:8000/v1"`
+for the judge endpoint. Both the HealthBench and VerInstruct reward functions
+read the judge model name from a single unified variable `JUDGE_MODEL=<judge_model_name>`.
+(The legacy `VLLM_MODEL` / `VERIF_MODEL_NAME` variables are still honored as
+fallbacks when `JUDGE_MODEL` is unset.) Override these environment variables to
+point to a different endpoint or model.
+
+When the judge and the training job must share a single GPU, keep the judge
+small and reserve only a small fraction of GPU memory so the trainer has room:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/judge_model \
+    --served-model-name <judge_model_name> \
+    --host localhost \
+    --port 8000 \
+    --dtype bfloat16 \
+    --max-model-len 4096 \
+    --max-num-seqs 16 \
+    --gpu-memory-utilization 0.15 \
+    --generation-config vllm
+```
 
 ---
 
@@ -152,14 +175,17 @@ Six reproduction scripts are provided under `Hacking_examples/Qwen3-4B/`:
 | `wxk_verif_reward_biased_self_praise_final_backup.sh` | VerInstruct | Self-praise |
 | `wxk_verif_reward_biased_format_final_backup.sh` | VerInstruct | Three-point structure |
 
-**Before running**, edit the following variables at the top of each script:
+**Before running**, point the scripts at your local model and judge server. The
+scripts provide defaults, but these environment variables override them without
+editing the files:
 
 ```bash
-MODEL_PATH="/path/to/Qwen3-4B"                   # local path to your base model
-CUDA_VISIBLE_DEVICES=0,1                          # GPUs to use
-VLLM_MODEL="<judge_model_name>"                   # judge model name on your server
-VERIF_JUDGE_BASE_URL="http://localhost:8000/v1"   # judge endpoint
-trainer.rollout_data_dir="/path/to/rollout_log"   # where to save rollout logs
+export MODEL_PATH="/path/to/Qwen3-4B"                   # local path to your base model
+export CUDA_VISIBLE_DEVICES=0,1                         # GPUs to use
+export N_GPUS_PER_NODE=2                                # must match CUDA_VISIBLE_DEVICES
+export JUDGE_MODEL="<judge_model_name>"                 # judge model (HealthBench + VerInstruct)
+export VERIF_JUDGE_BASE_URL="http://localhost:8000/v1"  # judge endpoint
+export ROLLOUT_DATA_DIR="/path/to/rollout_log"          # where to save rollout logs
 ```
 
 Then launch the script for the bias condition you want to reproduce:
@@ -182,6 +208,50 @@ bash Hacking_examples/Qwen3-4B/wxk_verif_reward_biased_self_praise_final_backup.
 
 # VerInstruct — format bias
 bash Hacking_examples/Qwen3-4B/wxk_verif_reward_biased_format_final_backup.sh
+```
+
+The VerInstruct (`wxk_*`) scripts share the same judge configuration as the
+HealthBench scripts (`JUDGE_MODEL` + `VERIF_JUDGE_BASE_URL`); set those to your
+local judge server, or point them at a hosted API via `VERIF_API_URLS` /
+`DASHSCOPE_API_KEY`.
+
+### Quick Sanity Check
+
+To verify the environment end-to-end before launching a full run, the snippet
+below runs a single optimization step on one GPU with a tiny rollout batch. It
+reuses a HealthBench script and overrides the heavy settings via CLI args, so it
+exercises the full rollout → judge → reward path without a long run:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export N_GPUS_PER_NODE=1
+export MODEL_PATH=/path/to/Qwen3-4B
+export JUDGE_MODEL=<judge_model_name>
+export VERIF_JUDGE_BASE_URL=http://localhost:8000/v1
+export ROLLOUT_DATA_DIR=/tmp/cherrl_smoke_rollouts
+export WANDB_MODE=disabled
+
+bash Hacking_examples/Qwen3-4B/HealthBench_biased_lexical_final_backup.sh \
+    data.train_batch_size=2 \
+    data.val_batch_size=2 \
+    data.max_prompt_length=512 \
+    data.max_response_length=128 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=2 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.n=2 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=1024 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
+    actor_rollout_ref.rollout.agent.num_workers=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    trainer.logger='["console"]' \
+    trainer.val_before_train=False \
+    trainer.total_training_steps=1 \
+    trainer.total_epochs=1 \
+    trainer.save_freq=-1 \
+    trainer.test_freq=-1 \
+    reward_model.max_concurrent=2 \
+    reward_model.max_rpm=120
 ```
 
 ---

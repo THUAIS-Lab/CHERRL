@@ -50,7 +50,9 @@ except ImportError:
 # Configuration for local LLM servers (used as fallback if reward_router_address is not provided)
 # All configuration can be set via environment variables:
 #   - VERIF_API_URLS: Comma-separated list of API URLs (default: dashscope)
-#   - VERIF_MODEL_NAME: Model name (default: qwen-flash)
+#   - JUDGE_MODEL: Unified judge model name shared with the HealthBench reward
+#       (takes precedence; VERIF_MODEL_NAME kept as a backward-compatible fallback)
+#   - VERIF_MODEL_NAME: Legacy model-name override (fallback when JUDGE_MODEL unset)
 #   - DASHSCOPE_API_KEY: API key for authentication
 
 def _get_default_api_urls() -> list[str]:
@@ -61,7 +63,7 @@ def _get_default_api_urls() -> list[str]:
     return ["https://dashscope.aliyuncs.com/compatible-mode/v1"]
 
 DEFAULT_API_URLS = _get_default_api_urls()
-DEFAULT_MODEL_NAME = os.environ.get("VERIF_MODEL_NAME")
+DEFAULT_MODEL_NAME = os.environ.get("JUDGE_MODEL") or os.environ.get("VERIF_MODEL_NAME")
 DEFAULT_API_KEY = os.environ.get("DASHSCOPE_API_KEY")  # None if not set
 
 # Prompt template for LLM-based scoring

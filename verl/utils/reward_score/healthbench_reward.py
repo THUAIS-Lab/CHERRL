@@ -81,7 +81,7 @@ class AsyncVLLMSampler:
     ):
         url_env = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
         self.base_urls = [base_url] if base_url else [url.strip() for url in url_env.split(',') if url.strip()]
-        self.model = model or os.getenv("VLLM_MODEL", "default")
+        self.model = model or os.getenv("JUDGE_MODEL") or os.getenv("VLLM_MODEL", "default")
         self.virtual_loads = {url: 0 for url in self.base_urls}
         self.timeout_val = timeout
         self.filter_think_tags = filter_think_tags
