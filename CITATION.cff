@@ -8,10 +8,11 @@ authors:
     email: wangxk0223@gmail.com
   - family-names: Hao
     given-names: Zhuoyuan
-    affiliation: Tsinghua University
+    affiliation: Harbin Institute of Technology, Shenzhen
+    website: "https://hhh2210.github.io/"
   - family-names: Hou
     given-names: Shuo
-    affiliation: Tsinghua University
+    affiliation: Xi'an Jiaotong University
   - family-names: Peng
     given-names: Hao
     affiliation: Tsinghua University
@@ -25,4 +26,35 @@ authors:
 date-released: "2026-06-03"
 license: Apache-2.0
 repository-code: https://github.com/THUAIS-Lab/CHERRL
-# url: https://arxiv.org/abs/TODO  # fill in once posted
+url: https://arxiv.org/abs/2606.04923
+identifiers:
+  - type: doi
+    value: 10.48550/arXiv.2606.04923
+    description: arXiv DOI for the paper
+preferred-citation:
+  type: article
+  title: "Reproducing, Analyzing, and Detecting Reward Hacking in Rubric-Based Reinforcement Learning"
+  authors:
+    - family-names: Wang
+      given-names: Xuekang
+      affiliation: Tsinghua University
+    - family-names: Hao
+      given-names: Zhuoyuan
+      affiliation: Harbin Institute of Technology, Shenzhen
+      website: "https://hhh2210.github.io/"
+    - family-names: Hou
+      given-names: Shuo
+      affiliation: Xi'an Jiaotong University
+    - family-names: Peng
+      given-names: Hao
+      affiliation: Tsinghua University
+    - family-names: Li
+      given-names: Juanzi
+      affiliation: Tsinghua University
+    - family-names: Wang
+      given-names: Xiaozhi
+      affiliation: Tsinghua University
+  journal: arXiv
+  year: 2026
+  doi: 10.48550/arXiv.2606.04923
+  url: https://arxiv.org/abs/2606.04923
