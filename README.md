@@ -4,16 +4,19 @@
 
 Official code for the paper **[Reproducing, Analyzing, and Detecting Reward Hacking in Rubric-Based Reinforcement Learning](https://arxiv.org/abs/2606.04923)**.
 
-Xuekang Wang<sup>\*</sup>, Zhuoyuan Hao<sup>\*</sup>, Shuo Hou, Hao Peng, Juanzi Li, Xiaozhi Wang<sup>†</sup>
+Xuekang Wang<sup>1,\*</sup>, [Zhuoyuan Hao](https://hhh2210.github.io/)<sup>2,\*</sup>, Shuo Hou<sup>3</sup>, Hao Peng<sup>1</sup>, Juanzi Li<sup>1</sup>, Xiaozhi Wang<sup>1,†</sup>
 
-Tsinghua University
+<sup>1</sup>Tsinghua University &nbsp; <sup>2</sup>Harbin Institute of Technology, Shenzhen &nbsp; <sup>3</sup>Xi'an Jiaotong University
 
 <sup>\*</sup> Equal contribution &nbsp;&nbsp;·&nbsp;&nbsp; <sup>†</sup> Corresponding author
 
 [![arXiv](https://img.shields.io/badge/arXiv-2606.04923-b31b1b.svg)](https://arxiv.org/abs/2606.04923)
+[![DOI](https://img.shields.io/badge/DOI-10.48550%2FarXiv.2606.04923-blue.svg)](https://doi.org/10.48550/arXiv.2606.04923)
 [![HF Paper](https://img.shields.io/badge/Hugging%20Face-Paper-yellow?logo=huggingface&logoColor=white)](https://huggingface.co/papers/2606.04923)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Code](https://img.shields.io/badge/Code-THUAIS--Lab%2FCHERRL-181717.svg?logo=github)](https://github.com/THUAIS-Lab/CHERRL)
+
+[Readable project summary and author context](https://hhh2210.github.io/projects/cherrl/)
 
 </div>
 
