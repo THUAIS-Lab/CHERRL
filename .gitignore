@@ -133,3 +133,5 @@ evaluation/WritingBench/responses/
 vllm_logs/pids.txt
 AGENTS.md
 CLAUDE.md
+data/
+vllm_logs/

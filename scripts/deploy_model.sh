@@ -134,7 +134,7 @@ async def health(request: web.Request) -> web.Response:
 
 async def on_startup(app: web.Application):
     connector = TCPConnector(limit=0, keepalive_timeout=30)
-    timeout = ClientTimeout(total=300, connect=10)
+    timeout = ClientTimeout(total=1200, connect=10)
     app["session"] = ClientSession(connector=connector, timeout=timeout)
     log.info("Load balancer ready. Backends: %s", [b.url for b in backends])
 
@@ -189,7 +189,7 @@ done
 
 # ---------- wait for all backends to become healthy ----------
 echo "[INFO] Waiting for $NUM_GPUS backend(s) to become healthy..."
-HEALTH_TIMEOUT=300
+HEALTH_TIMEOUT=1200
 for i in "${!GPU_ARRAY[@]}"; do
     PORT="${PORTS[$i]}"
     GPU_ID="${GPU_ARRAY[$i]}"

@@ -30,7 +30,7 @@ RUNS = [
 ]
 
 METRICS = ["reward_extra/acc/mean", "critic/rewards/mean"]
-LABELS  = ["Gold Reward", "Proxy Reward"]
+LABELS  = ["Clean Reward", "Proxy Reward"]
 COLORS  = ["#589C3F", "#4677AF"]
 ALPHA   = 0.9
 
