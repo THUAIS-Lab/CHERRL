@@ -3,11 +3,11 @@
 # 配置参数 - 请根据实际情况修改以下参数
 # ============================================
 # API 配置
-ROLLOUT_API_KEY="REMOVED_API_KEY" # for example, you can use "sk-xxxx"
+ROLLOUT_API_KEY="${ROLLOUT_API_KEY:?Set ROLLOUT_API_KEY before running this script}"
 ROLLOUT_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" # for example, you can use "https://dashscope.aliyuncs.com/compatible-mode/v1"
 ROLLOUT_MODEL_NAME="qwen-flash" # for example, you can use "qwen-flash" 
 
-EVALUATOR_API_KEY="REMOVED_API_KEY" # for example, you can use "sk-xxxx"
+EVALUATOR_API_KEY="${EVALUATOR_API_KEY:?Set EVALUATOR_API_KEY before running this script}"
 EVALUATOR_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" # for example, you can use "https://dashscope.aliyuncs.com/compatible-mode/v1"
 EVALUATOR_MODEL_NAME="qwen-flash" # for example, you can use "qwen-flash"
 # 文件路径配置 
@@ -47,7 +47,7 @@ GEN_CMD="$GEN_CMD --output_file \"$RESPONSE_OUTPUT_FILE\""
 GEN_CMD="$GEN_CMD --query_file \"$QUERY_FILE\""
 
 # 执行 generate_response.py
-echo "Executing: $GEN_CMD"
+echo "Executing: generate_response.py"
 eval $GEN_CMD
 
 # 检查执行结果
@@ -83,7 +83,7 @@ if [ "$EVALUATOR" = "claude" ]; then
 fi
 
 # 执行 evaluate_benchmark.py
-echo "Executing: $EVAL_CMD"
+echo "Executing: evaluate_benchmark.py"
 eval $EVAL_CMD
 
 # 检查执行结果
