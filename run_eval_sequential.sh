@@ -49,7 +49,7 @@ BASE_URL="http://localhost:8000/v1"
 JUDGE_MODEL="qwen-plus"
 JUDGE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 NUM_THREADS=20
-JUDGE_API_KEY="REMOVED_API_KEY"
+JUDGE_API_KEY="${JUDGE_API_KEY:?Set JUDGE_API_KEY before running this script}"
 
 # 日志文件后缀（可在脚本内修改，例如：_v2、_test 等）
 # 例如设为 "_v2" 时，日志名会变成 eval_alpaca_v2.log 等
