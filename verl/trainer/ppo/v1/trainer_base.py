@@ -1305,6 +1305,68 @@ class PPOTrainer(ABC):
         if shutdown_workers is not None:
             shutdown_workers()
 
+    def _cherrl_try_get(self, keys: list[str], partition_id: str, fields: list[str]):
+        """Fetch optional fields from TransferQueue; None if any is absent (dumps must never break training)."""
+        try:
+            return tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=fields)
+        except Exception as exc:  # noqa: BLE001 - missing fields surface as backend-specific errors
+            logger.warning("CHERRL rollout dump: fields %s unavailable: %s", fields, exc)
+            return None
+
+    def _rollout_extra_info_keys_to_dump(self) -> list[str]:
+        """Dataset extra_info keys to copy into rollout JSONL (trainer.rollout_extra_info_keys_to_dump)."""
+        keys = self.config.trainer.get("rollout_extra_info_keys_to_dump", None) or []
+        if isinstance(keys, str):
+            try:
+                parsed = json.loads(keys)
+                return [str(k) for k in parsed] if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return [part.strip() for part in keys.split(",") if part.strip()]
+        return [str(k) for k in keys]
+
+    def _cherrl_rollout_dump_extras(self, batch: KVBatchMeta) -> dict[str, list]:
+        """Per-sample columns for rollout dumps, in batch.keys order: reward extra info (acc, llm_score,
+        genrm_response, ...), logprob_sum / logprob_per_token of the response, and configured dataset extra_info keys."""
+        n = len(batch.keys)
+        out: dict[str, list] = {}
+
+        data = self._cherrl_try_get(batch.keys, batch.partition_id, ["extra_fields"])
+        if data is not None:
+            infos = [
+                (ef.get("reward_extra_info") or {}) if isinstance(ef, dict) else {}
+                for ef in data["extra_fields"].tolist()
+            ]
+            for key in dict.fromkeys(k for info in infos for k in info):
+                out[key] = [info.get(key) for info in infos]
+
+        data = self._cherrl_try_get(batch.keys, batch.partition_id, ["old_log_probs", "response_mask"])
+        if data is not None:
+            lp_sum, lp_tok = [], []
+            for lp, mask in zip(data["old_log_probs"].unbind(), data["response_mask"].unbind(), strict=True):
+                mask = mask.float()
+                total = float((lp.float() * mask).sum())
+                lp_sum.append(total)
+                lp_tok.append(total / max(float(mask.sum()), 1.0))
+            out["logprob_sum"], out["logprob_per_token"] = lp_sum, lp_tok
+
+        wanted = self._rollout_extra_info_keys_to_dump()
+        if wanted:
+            data = self._cherrl_try_get(batch.keys, batch.partition_id, ["extra_info"])
+            if data is None:  # dataset fields may live only on the prompt entry (key = sample uid prefix)
+                prompt_keys = [key.rsplit("_", 2)[0] for key in batch.keys]
+                uniq = list(dict.fromkeys(prompt_keys))
+                got = self._cherrl_try_get(uniq, batch.partition_id, ["extra_info"])
+                if got is not None:
+                    by_uid = dict(zip(uniq, got["extra_info"].tolist(), strict=True))
+                    infos = [by_uid.get(k) for k in prompt_keys]
+                else:
+                    infos = [None] * n
+            else:
+                infos = data["extra_info"].tolist()
+            for key in wanted:
+                out.setdefault(key, [info.get(key) if isinstance(info, dict) else None for info in infos])
+        return out
+
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
@@ -1340,6 +1402,14 @@ class PPOTrainer(ABC):
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            # CHERRL: offline analysis (scripts/stat_raw_score_vs_acc.py, rescore_jsonl_with_main_bias_template.py,
+            # stat_logprob_by_score.py, HealthBench rubric alignment) reads reward extra info, per-sample log-probs
+            # and selected dataset extra_info keys from rollout JSONL; upstream V1 dumps only uid.
+            try:
+                for key, values in self._cherrl_rollout_dump_extras(batch).items():
+                    reward_extra_infos_dict.setdefault(key, [values[i] for i in sorted_indices])
+            except Exception as exc:  # noqa: BLE001 - never fail a training step over dump columns
+                logger.warning("CHERRL rollout dump extras skipped: %s", exc)
 
             self._dump_generations(
                 inputs=inputs,

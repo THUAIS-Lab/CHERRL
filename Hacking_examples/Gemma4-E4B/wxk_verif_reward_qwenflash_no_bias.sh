@@ -8,6 +8,8 @@ set -x
 #   - use_fused_kernels=False        fused kernels skip final_logit_softcapping (verl #7991)
 #   - FSDP2 + param/optimizer offload, bf16 ref, micro-batch 1, chunked entropy: 262k vocab logits
 # Run from the repo root. DASHSCOPE_API_KEY must be in the environment (or CHERRL/.env).
+# ROLLOUT_DATA_DIR (optional): dump per-step rollout JSONL (input/output/score/step + acc, llm_score,
+# genrm_response, logprob_sum, logprob_per_token) for RHDA and the scripts/ analyses.
 export JUDGE_MODEL="${JUDGE_MODEL:-qwen-flash}"
 export VERIF_JUDGE_ENABLE_THINKING=false
 export VERIF_STRIP_RESPONSE_THINK="${VERIF_STRIP_RESPONSE_THINK:-true}"
@@ -72,4 +74,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.resume_mode=disable \
     trainer.total_training_steps=${TOTAL_STEPS:-600} \
-    trainer.total_epochs=1 "$@"
+    trainer.total_epochs=1 \
+    ${ROLLOUT_DATA_DIR:+trainer.rollout_data_dir=$ROLLOUT_DATA_DIR} "$@"

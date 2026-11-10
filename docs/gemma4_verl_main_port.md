@@ -20,13 +20,22 @@ Not carried over:
   `trainer.rollout_extra_info_keys_to_dump` key is only in `ppo_trainer.yaml` (FSDP).
 - `verl/version/version` follows upstream (`0.10.0.dev`).
 
-## Known gap: probe / extra-info dumps are on the legacy trainer only
+## Trainer path: V1 rollout dumps carry CHERRL's analysis fields
 
-Upstream main defaults to the V1 trainer (`trainer.use_v1=true`, `verl/trainer/ppo/v1/`). CHERRL's
-additions in `verl/trainer/ppo/ray_trainer.py` (probe log-prob tracking via `trainer.probe_jsonl`,
-`rollout_extra_info_keys_to_dump`, per-sample log-prob in rollout dumps) are merged but only run
-with `trainer.use_v1=false` (legacy `main_ppo_v0`, deprecated upstream). Porting them to
-`verl/trainer/ppo/v1/trainer_base.py` is still to do.
+Upstream main defaults to the V1 trainer (`trainer.use_v1=true`, `verl/trainer/ppo/v1/`), whose
+rollout dump writes only `input/output/gts/score/step/uid`. CHERRL's offline analyses need more:
+`scripts/stat_raw_score_vs_acc.py` (`acc`), `scripts/rescore_jsonl_with_main_bias_template.py`
+(`acc`, `genrm_response`), `scripts/stat_logprob_by_score.py` (`logprob_per_token`) and the
+HealthBench rubric alignment (`trainer.rollout_extra_info_keys_to_dump`). This branch extends
+`_log_rollout_data` in `verl/trainer/ppo/v1/trainer_base.py` to also write every reward extra-info
+key, `logprob_sum` / `logprob_per_token` of the response, and the configured dataset `extra_info`
+keys. RHDA only needs `{step, input, output, score}`, which V1 already writes.
+
+Still legacy-only: probe log-prob tracking (`trainer.probe_jsonl`, used by
+`Hacking_examples/Qwen3-4B/*_biased.sh`) lives in `verl/trainer/ppo/ray_trainer.py` and runs only
+with `trainer.use_v1=false` (legacy `main_ppo_v0`, deprecated upstream). It only produces online
+`probe/*` metrics; no script in the repo reads them offline. Port it to V1 before running the biased
+probe experiments on Gemma 4.
 
 ## Environment
 
