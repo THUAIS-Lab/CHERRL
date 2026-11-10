@@ -12,130 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+import dataclasses
 import functools
+import logging
 import os
+import subprocess
 from typing import Callable, Optional
 
-import torch
-import torch.distributed
+from ..tracking import RLInsightLogger
+from .config import ProfilerConfig
 
-from ..memory_utils import MemorySnapshotSampler, enable_memory_visualize
-from .config import ProfilerConfig, TorchMemoryToolConfig, TorchProfilerToolConfig
+logger = logging.getLogger(__name__)
 
 
-class Profiler:
-    """A PyTorch profiler wrapper class for collecting performance metrics.
+def _hook_print(msg: str) -> None:
+    """Report finish-hook activity on stdout.
 
-    TODO(haibin.lin): this should implement the DistProfiler interface, and the config should be unified.
-
-    This profiler provides a convenient interface for profiling PyTorch operations,
-    with support for:
-
-    - CPU and CUDA activity profiling
-    - Configurable profiling schedule (wait/warmup/active steps)
-    - Multi-rank profiling support
-    - Chrome trace export
-
-    Args:
-        config: Configuration object containing profiling parameters
+    Worker processes do not necessarily inherit the ``verl`` logger configuration, so hook
+    progress is printed rather than logged to guarantee it reaches the Ray worker logs.
     """
-
-    def __init__(
-        self, config: ProfilerConfig, tool_config: Optional[TorchProfilerToolConfig] = None, save_file_prefix=None
-    ):
-        # note : if we do not set use_profile, it will be set as None, so that all function will be skip
-        if not config:
-            config = ProfilerConfig(ranks=[], enable=False)
-
-        self.save_file_prefix = save_file_prefix
-
-        if not tool_config:
-            assert not config.enable, "tool_config must be provided when profiler is enabled"
-        self.prof = None
-        self.saved = False
-        self.enable = config.enable
-        if not config.enable:
-            return
-        self.config = config
-        self.tool_config = tool_config
-        self.rank = torch.distributed.get_rank()
-        # we need to validate the config before using the profiler
-        self._validate()
-
-        if self.rank in self.config.ranks or self.config.all_ranks:
-            print(f"[Profiler] Profiler init for rank {self.rank}")
-
-            self.prof = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                schedule=torch.profiler.schedule(
-                    wait=max(self.tool_config.step_start - 1, 0),
-                    warmup=1 if self.tool_config.step_start > 0 else 0,
-                    active=self.tool_config.step_end - self.tool_config.step_start,
-                    repeat=1,
-                ),
-                record_shapes=True,
-                with_stack=True,
-            )
-
-    def _trace_handler(self, prof):
-        if not os.path.exists(self.config.save_path):
-            os.makedirs(self.config.save_path)
-
-        save_file_name = f"prof_rank-{self.rank}.json.gz"
-        if self.save_file_prefix is not None:
-            save_file_name = self.save_file_prefix + "_" + save_file_name
-        save_path = os.path.join(self.config.save_path, save_file_name)
-        print(f"[Profiler] Saving trace to {save_path}")
-        prof.export_chrome_trace(save_path)
-        self.enable = False
-        self.saved = True
-
-    def _validate(self):
-        if self.enable:
-            if self.config.ranks is None:
-                print("[WARNING] Profile ranks is not set, default to rank 0")
-                self.config.ranks = [0]
-            assert self.tool_config.step_start >= 0, "[ERROR] Profile step start must be greater than 0"
-            assert self.tool_config.step_end >= 0, "[ERROR] Profile step end must be greater than 0"
-            assert self.tool_config.step_start < self.tool_config.step_end, (
-                "[ERROR] Profile step start must be less than step end"
-            )
-
-    def check(self):
-        return self.prof is not None and self.enable
-
-    def start(self):
-        if self.check():
-            print(f"[Profiler] started for rank {self.rank}")
-            self.prof.start()
-
-    def step(self):
-        if self.check():
-            self.prof.step()
-
-    def stop(self):
-        if self.check():
-            self.step()
-            print(f"[Profiler] stopped for rank {self.rank}")
-            self.prof.stop()
-            self.save()
-
-    def save(self):
-        if self.prof is not None and not self.saved and self.tool_config.manual_save:
-            self._trace_handler(prof=self.prof)
-
-    def stop_and_save(self):
-        if self.check():
-            self.stop()
-            self.save()
-
-    def stop_trace(self):
-        if self.check():
-            print(f"[Profiler] Trace stopped for rank {self.rank}")
-            self.enable = False
+    print(f"[Profiler][finish_hook] {msg}", flush=True)
 
 
 def mark_start_range(
@@ -195,21 +92,36 @@ class DistProfiler:
     - nsys: NsightSystemsProfiler
     - npu: NPUProfiler (Ascend)
     - torch: PyTorch torch.profiler wrapper
-    - torch_memory: Torch CUDA memory snapshot dump
+    - torch_memory: Torch CUDA/NPU memory snapshot dump
+    - precision_debugger: msprobe precision debugger
     """
 
     def __init__(
-        self, rank: int, config: Optional[ProfilerConfig] = None, tool_config: Optional[object] = None, **kwargs
+        self,
+        rank: int,
+        config: Optional[ProfilerConfig] = None,
+        tool_config: Optional[object] = None,
+        save_file_prefix: Optional[str] = None,
+        **kwargs,
     ):
         # Default config
-        if not config:
+        if config is None:
             config = ProfilerConfig(ranks=[], enable=False, tool_config=None)
 
         if tool_config is None:
             tool_config = config.tool_config
 
+        self.rank = rank
+        self.config = config
+        self.tool_config = tool_config
+        # Optional label (typically the worker role, e.g. "actor"/"critic"/"ref") embedded
+        # in per-process trace filenames so results from different roles are distinguishable.
+        self.save_file_prefix = save_file_prefix
+
         self._impl = None
         self._tool = getattr(config, "tool", None)
+        self._enable = config.enable
+        self._this_step = False
 
         # Normalize rank selection
         self._this_rank = False
@@ -219,7 +131,26 @@ class DistProfiler:
             self._this_rank = rank in config.ranks
         else:
             # default rank 0 if enabled but ranks unspecified
-            self._this_rank = (rank == 0) if config.enable else False
+            self._this_rank = (rank == 0) if self._enable else False
+
+        # precision_debugger delegates rank filtering to msprobe config.json.
+        # Keep verl-side rank gate open when profiler is enabled.
+        if self._tool == "precision_debugger" and self._enable:
+            self._this_rank = True
+
+        # Finish-hook rank selection (independent of the profiled ranks). The command runs on
+        # `finish_hook_all_ranks`/`finish_hook_ranks`, defaulting to the profiled ranks when unset.
+        self._finish_hook_cmd = getattr(config, "finish_hook_cmd", None)
+        self._relocate_results = getattr(config, "relocate_results", False)
+        if getattr(config, "finish_hook_all_ranks", False):
+            self._finish_hook_this_rank = True
+        elif getattr(config, "finish_hook_ranks", None):
+            self._finish_hook_this_rank = rank in config.finish_hook_ranks
+        else:
+            self._finish_hook_this_rank = self._this_rank
+
+        # TorchMemoryProfiler currently do not support discrete mode.
+        self._discrete = getattr(tool_config, "discrete", False) if tool_config else False
 
         # Lazy import to avoid circular deps
         if self._tool == "nsys":
@@ -231,19 +162,173 @@ class DistProfiler:
 
             self._impl = _Npu(rank=rank, config=config, tool_config=tool_config, **kwargs)
         elif self._tool == "torch":
-            # Use the torch profiler wrapper defined above
-            self._impl = Profiler(config=config, tool_config=tool_config)
+            from .torch_profile import Profiler as _Torch
+
+            self._impl = _Torch(rank=rank, config=config, tool_config=tool_config, save_file_prefix=save_file_prefix)
         elif self._tool == "torch_memory":
+            from .torch_memory_profile import TorchMemoryProfiler
+
             self._impl = TorchMemoryProfiler(rank=rank, config=config, tool_config=tool_config)
+        elif self._tool == "precision_debugger":
+            from .precision_debugger_profile import PrecisionDebuggerProfiler as _Precision
+
+            self._impl = _Precision(precision_cfg=tool_config, rank=rank, save_path=config.save_path)
         else:
             # Fallback to a no-op impl
             self._impl = _NoOpProfiler()
 
-    def start(self, **kwargs):
-        return getattr(self._impl, "start", lambda **_: None)(**kwargs)
+    def check_enable(self):
+        """Return whether profiling is enabled by configuration."""
+        return self._enable
 
-    def stop(self):
-        return getattr(self._impl, "stop", lambda: None)()
+    def check_this_rank(self):
+        """Return whether current rank should perform profiling."""
+        return self._this_rank
+
+    def check_this_step(self):
+        """Return whether current global step is marked for profiling."""
+        return self._this_step
+
+    def is_discrete_mode(self):
+        """Return whether profiler backend runs in discrete mode."""
+        return self._discrete
+
+    def start(self, **kwargs):
+        """Profiler switch for the Ray main flow; sets `this_step=True`.
+
+        Args:
+            **kwargs: Runtime arguments forwarded to backend `start`.
+        """
+        if self.check_enable() and self.check_this_rank():
+            self._this_step = True
+            return getattr(self._impl, "start", lambda **_: None)(**kwargs)
+
+    def stop(self, run_command: bool = True):
+        """Profiler switch for the Ray main flow; sets `this_step=False`.
+
+        Stops the backend profiler and relocates its artifacts into ``save_path`` on every profiled
+        step (so traces accumulate there). The user's finish command, however, runs only when
+        ``run_command`` is True -- the trainer sets that on the *last* profiled step -- so the command
+        (typically a one-shot upload of the whole ``save_path``) fires once at the end instead of once
+        per step. The hook is invoked outside the ``check_this_rank`` gate so the command may target
+        ranks that were not themselves profiled.
+        """
+        result = None
+        if self.check_enable() and self.check_this_rank():
+            self._this_step = False
+            result = getattr(self._impl, "stop", lambda: None)()
+        if self.check_enable():
+            self._run_finish_hook(run_command=run_command)
+        return result
+
+    def run_finish_hook(self, run_command: bool = True) -> None:
+        """Relocate backend artifacts and, when ``run_command`` is True, run the user's command.
+
+        Kept for external drivers that stop their own backend and then want verl to relocate
+        artifacts and optionally upload. Inference servers relocate their own traces into
+        ``save_path`` and rely on the training worker's end-of-run upload, so they no longer
+        call this.
+        """
+        if self.check_enable():
+            self._run_finish_hook(run_command=run_command)
+
+    def _run_finish_hook(self, run_command: bool = True) -> None:
+        """Relocate backend artifacts every step; run the user's finish command once, at the end.
+
+        Relocation (currently nsys) runs on every ``stop()`` on the ranks that profiled, so a step's
+        artifacts land in ``save_path`` as they are produced. The user command runs only when
+        ``run_command`` is True -- the trainer passes that on the last profiled step -- so a command
+        that uploads the whole ``save_path`` sends each trace exactly once, at the end, instead of
+        re-uploading the accumulating directory every step. Both are best-effort: failures are
+        reported and never interrupt training.
+        """
+        save_path = getattr(self.config, "save_path", None)
+
+        # (1) Relocate backend artifacts (currently nsys) out of framework-fixed dirs into save_path,
+        # every step, so they accumulate there for the end-of-run upload.
+        if self._relocate_results and self.check_this_rank():
+            relocate = getattr(self._impl, "relocate_results", None)
+            if callable(relocate):
+                try:
+                    relocate(save_path, rank=self.rank, save_file_prefix=self.save_file_prefix)
+                except Exception as e:  # never let post-processing crash the training loop
+                    _hook_print(f"rank {self.rank}: relocating results failed: {e}")
+
+        # (2) Run the user's command, but only on the final stop and only on the selected ranks.
+        if not run_command:
+            return
+        _hook_print(
+            f"rank {self.rank}: profiling finished; cmd={self._finish_hook_cmd!r}, "
+            f"run_on_this_rank={self._finish_hook_this_rank}, save_path={save_path!r}"
+        )
+        if not self._finish_hook_cmd:
+            return
+        if not self._finish_hook_this_rank:
+            _hook_print(f"rank {self.rank}: command skipped, rank not selected by finish_hook_ranks/all_ranks")
+            return
+        self._run_finish_command(self._finish_hook_cmd, save_path)
+
+    def _run_finish_command(self, cmd: str, save_path: Optional[str]) -> None:
+        """Execute the user finish command in a shell once profiling is done.
+
+        The command is meant to ship the accumulated traces off the node, e.g.
+        ``mlx asset upload "$VERL_PROFILE_SAVE_PATH"``. Because it runs a single time (after the last
+        profiled step) rather than once per step, uploading the whole ``save_path`` sends each trace
+        exactly once. The run context is exported as ``VERL_PROFILE_SAVE_PATH``, ``VERL_PROFILE_TOOL``,
+        ``VERL_PROFILE_RANK``, ``VERL_PROFILE_PID``, ``VERL_PROFILE_ROLE`` and (nsys only)
+        ``VERL_PROFILE_RAY_NSIGHT_DIR``. Merged stdout/stderr is streamed so long uploads are visible.
+        """
+        env = os.environ.copy()
+        env["VERL_PROFILE_SAVE_PATH"] = str(save_path) if save_path else ""
+        env["VERL_PROFILE_TOOL"] = str(self._tool) if self._tool else ""
+        env["VERL_PROFILE_RANK"] = str(self.rank)
+        env["VERL_PROFILE_PID"] = str(os.getpid())
+        if self.save_file_prefix:
+            env["VERL_PROFILE_ROLE"] = str(self.save_file_prefix)
+        if self._tool == "nsys":
+            from .nvtx_profile import RAY_NSIGHT_LOG_DIR
+
+            env["VERL_PROFILE_RAY_NSIGHT_DIR"] = RAY_NSIGHT_LOG_DIR
+
+        _hook_print(f"rank {self.rank}: running command: {cmd}")
+        _hook_print(f"rank {self.rank}: VERL_PROFILE_SAVE_PATH={env['VERL_PROFILE_SAVE_PATH']}")
+        # Route through the shell so $VERL_PROFILE_* and shell syntax in `cmd` work.
+        try:
+            proc = subprocess.Popen(
+                ["/bin/sh", "-c", cmd],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:  # command failed to launch; do not crash training
+            _hook_print(f"rank {self.rank}: command failed to launch: {e}")
+            logger.warning("profiler finish hook: command failed to launch on rank %s: %s", self.rank, e)
+            return
+        with proc:
+            for line in proc.stdout:
+                _hook_print(f"rank {self.rank}: {line.rstrip()}")
+        returncode = proc.returncode
+        _hook_print(f"rank {self.rank}: command exited with {returncode}")
+        if returncode != 0:
+            logger.warning("profiler finish hook: command exited with %s on rank %s: %s", returncode, self.rank, cmd)
+
+    def step(self):
+        """Mark the end of one training step in the trace, i.e. one whole RL cycle.
+
+        Delegates to backends that label step boundaries (currently the torch profiler, which
+        writes torch's ``ProfilerStep#<n>``); for all others this is a no-op. It never changes
+        what gets collected -- ``global_profiler.steps`` decides that -- and the mini-batches a
+        step is made of are annotated inside the step instead of advancing it.
+
+        Gated on enable/rank only (not `this_step`): the training loop may run inside a
+        nested worker whose profiler was never explicitly started, while the underlying
+        torch profiler is process-global. The backend keeps `step` safe (no-op) whenever
+        no profiler is actively running.
+        """
+        if self.check_enable() and self.check_this_rank():
+            return getattr(self._impl, "step", lambda: None)()
 
     @classmethod
     def annotate(
@@ -254,28 +339,79 @@ class DistProfiler:
         category: Optional[str] = None,
         **kwargs_outer,
     ) -> Callable:
+        """Decorate instance methods with backend profiler annotations.
+
+        The wrapped function is executed directly if profiling is disabled,
+        not selected for current rank/step, or backend annotate fails.
+        """
+
         def decorator(func):
             @functools.wraps(func)
             def wrapper(self_instance, *args, **kwargs_inner):
                 profiler = getattr(self_instance, "profiler", None)
-                if not profiler:
+                if profiler is None:
                     return func(self_instance, *args, **kwargs_inner)
 
-                impl = profiler._impl
-                if hasattr(impl, "annotate"):
-                    try:
-                        actual_decorator = impl.annotate(
-                            message=message, color=color, domain=domain, category=category, **kwargs_outer
-                        )
-
-                        return actual_decorator(func)(self_instance, *args, **kwargs_inner)
-                    except Exception:
+                with RLInsightLogger.trace_state(
+                    kwargs_outer.get("role", func.__qualname__), state_lane_id=f"rank_{profiler.rank}"
+                ):
+                    if not profiler.check_enable() or not profiler.check_this_step() or not profiler.check_this_rank():
                         return func(self_instance, *args, **kwargs_inner)
-                return func(self_instance, *args, **kwargs_inner)
+
+                    impl = profiler._impl
+                    if hasattr(impl, "annotate"):
+                        try:
+                            actual_decorator = impl.annotate(
+                                message=message, color=color, domain=domain, category=category, **kwargs_outer
+                            )
+                            wrapped = actual_decorator(func)
+                        except Exception:
+                            # Only fall back when *setting up* backend profiling fails.
+                            # Never guard the call to func itself here: doing so would
+                            # swallow real stage errors and re-run func (executing the
+                            # stage twice with duplicated side effects).
+                            wrapped = func
+                        return wrapped(self_instance, *args, **kwargs_inner)
+                    return func(self_instance, *args, **kwargs_inner)
 
             return wrapper
 
         return decorator
+
+
+def build_rollout_dist_profiler(
+    replica_rank: int,
+    replica_world_size: int,
+    config: Optional[ProfilerConfig] = None,
+    tool_config: Optional[object] = None,
+) -> "DistProfiler":
+    """Build a :class:`DistProfiler` for a rollout replica, treating ``config.ranks`` as global GPU ranks.
+
+    Training workers key their ``DistProfiler`` on the worker's own global GPU rank, so ``ranks``
+    lists global ranks there. A rollout replica instead drives a single inference engine that spans
+    ``replica_world_size`` GPUs (``tensor_model_parallel_size * data_parallel_size *
+    pipeline_model_parallel_size``); replica ``r`` owns the global ranks
+    ``[r * replica_world_size, (r + 1) * replica_world_size)``.
+
+    To keep ``ranks`` meaning the same thing for rollout as for the training roles, every rank in
+    ``config.ranks`` is mapped to the replica that owns it (``rank // replica_world_size``) and the
+    replica is profiled when it owns at least one requested rank. For example with
+    ``replica_world_size == 8`` (e.g. ``tp=8``), ``ranks=[0, 8]`` profiles replica 0 (owns global
+    rank 0) and replica 1 (owns global rank 8) instead of replica indices 0 and 8. ``all_ranks`` and
+    the empty-``ranks`` default (profile the replica owning global rank 0, i.e. replica 0) are
+    preserved.
+    """
+    if config is not None and not getattr(config, "all_ranks", False):
+        ranks = list(getattr(config, "ranks", None) or [])
+        if ranks and replica_world_size and replica_world_size > 0:
+            replica_ranks = sorted({int(rank) // replica_world_size for rank in ranks})
+            if dataclasses.is_dataclass(config) and not isinstance(config, type):
+                config = dataclasses.replace(config, ranks=replica_ranks)
+            else:
+                # OmegaConf DictConfig or other mutable mapping-style config.
+                config = copy.deepcopy(config)
+                config.ranks = replica_ranks
+    return DistProfiler(rank=replica_rank, config=config, tool_config=tool_config)
 
 
 class _NoOpProfiler:
@@ -285,80 +421,8 @@ class _NoOpProfiler:
     def stop(self):
         return
 
-
-class TorchMemoryProfiler:
-    """Profiler that dumps CUDA memory snapshots at step boundaries.
-
-    Behavior:
-    - On first construction (per process), enable memory history recording if CUDA is available
-    - On start(step=X), remember sub_dir for this step
-    - On stop(), dump a memory snapshot into config.save_path under the remembered sub_dir
-    """
-
-    _memory_history_enabled: bool = False
-
-    def __init__(
-        self, rank: int, config: Optional[ProfilerConfig], tool_config: Optional[TorchMemoryToolConfig] = None
-    ):
-        # Always respond to explicit start/stop calls for torch_memory tool,
-        # regardless of per-role enable flag, to align with global step control.
-        self.enable = True
-        if not config:
-            config = ProfilerConfig(ranks=[])
-        self.config = config
-        self.rank = rank
-        self.this_step = False
-        self.sub_dir = None
-        self.sampler = MemorySnapshotSampler()
-
-        # Get parameters from tool_config, with fallback to defaults
-        if tool_config:
-            trace_alloc_max_entries = tool_config.trace_alloc_max_entries
-            stack_depth = tool_config.stack_depth
-        else:
-            trace_alloc_max_entries = 100_000
-            stack_depth = 32
-
-        # Best-effort enable memory history once
-        if not TorchMemoryProfiler._memory_history_enabled:
-            try:
-                enable_memory_visualize(trace_alloc_max_entries=trace_alloc_max_entries, stack_depth=stack_depth)
-            except Exception:
-                # silently ignore if not supported
-                pass
-            TorchMemoryProfiler._memory_history_enabled = True
-
-    def start(self, **kwargs):
-        if not self.enable:
-            return
-        if not self._should_profile_this_rank():
-            return
-        profile_step = kwargs.get("profile_step", None)
-        # Keep ranks aligned under same folder name
-        self.sub_dir = f"step{profile_step}" if profile_step is not None else None
-        self.this_step = True
-
-    def stop(self):
-        if not self.enable or not self.this_step:
-            return
-        self.this_step = False
-        if not self._should_profile_this_rank():
-            return
-        out_dir = self.config.save_path or "outputs/profile"
-        tag = "torch_memory"
-        # Dump snapshot; all ranks write into same sub_dir
-        try:
-            self.sampler.dump_memory_snapshot(out_dir=out_dir, tag=tag, sub_dir=self.sub_dir)
-        except Exception:
-            pass
-
-    def _should_profile_this_rank(self) -> bool:
-        if self.config.all_ranks:
-            return True
-        if self.config.ranks:
-            return self.rank in self.config.ranks
-        # default rank 0
-        return self.rank == 0
+    def step(self):
+        return
 
 
 class DistProfilerExtension:
@@ -384,6 +448,16 @@ class DistProfilerExtension:
         self.profiler.start(**kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def stop_profile(self) -> None:
-        """Stop profiling for the current rank in the current training step."""
-        self.profiler.stop()
+    def stop_profile(self, run_command: bool = True) -> None:
+        """Stop profiling for the current rank in the current training step.
+
+        ``run_command`` is True only on the last profiled step, so the finish command (e.g. the
+        trace upload) fires once at the end rather than once per step. Backend stop and artifact
+        relocation happen every step regardless.
+        """
+        self.profiler.stop(run_command=run_command)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def step_profile(self) -> None:
+        """Mark the end of one training step in the trace."""
+        self.profiler.step()

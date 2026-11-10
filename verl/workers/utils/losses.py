@@ -14,14 +14,15 @@
 
 
 import torch
-import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
+from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
+from verl.workers.utils.padding import no_padding_2_padding
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -53,50 +54,24 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {}
 
 
-def _slice_response_from_unpad_output(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
-    """Slice response from unpad model output.
-
-    Args:
-        tensor: model output tensor of shape [bsz, 1]
-        data: TensorDict with "prompt_ids", "response_ids", "attention_mask"
-
-    Returns:
-        tensor: sliced response tensor of shape [bsz, max_response_len]
-    """
-    values = tensor.values() if tensor.is_nested else tensor
-    prompt_ids = data["prompts"]
-    response_ids = data["responses"]
-    attention_mask = data["attention_mask"]
-
-    if prompt_ids.is_nested:
-        prompt_lens = prompt_ids.offsets().diff()
-        response_lens = response_ids.offsets().diff()
-        max_response_len = response_ids.offsets().max().item()
-    else:
-        assert not attention_mask.is_nested
-        prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
-        response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
-        max_response_len = response_ids.shape[1]
-
-    sequence_lens = prompt_lens + response_lens
-    sequence_offsets = sequence_lens.cumsum(dim=0)
-    assert sequence_offsets[-1].item() == values.shape[0]
-
-    response_list = []
-    for resp_len, seq_offset in zip(response_lens, sequence_offsets, strict=True):
-        pad_size = max_response_len - resp_len
-        # left-shift model output by one token for log_probs/values
-        response_list.append(F.pad(values[seq_offset - resp_len - 1 : seq_offset - 1], (0, pad_size)))
-
-    output = torch.stack(response_list, dim=0)
-    return output
-
-
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
-    log_prob = _slice_response_from_unpad_output(model_output["log_probs"], data)
+    """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
+    log_prob = no_padding_2_padding(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
-        entropy = _slice_response_from_unpad_output(entropy, data)
+        entropy = no_padding_2_padding(entropy, data)
+    sc_outputs = {
+        key: no_padding_2_padding(model_output[key], data)
+        for key in (
+            "sc_correction",
+            "sc_sampler_head_mass",
+            "sc_train_head_mass",
+            "sc_support_aligned",
+            "sc_sampler_tail_mass",
+            "sc_support_unknown",
+        )
+        if key in model_output
+    }
 
     # global batch info for loss aggregation
     config.global_batch_info["dp_size"] = data["dp_size"]
@@ -104,7 +79,28 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
+    # assumes that if any of the global batch info is set, the policy_loss_fn will
+    # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
+    # to reflect the mean loss over the global batch
+    if (
+        data["dp_size"] > 1
+        or data["batch_num_tokens"] is not None
+        or data["global_batch_size"] is not None
+        or config.loss_scale_factor is not None
+    ):
+        metric_aggregation = AggregationType.SUM
+    else:
+        metric_aggregation = AggregationType.MEAN
+
     metrics = {}
+
+    # select fields and convert to padded tensor
+    fields = ["response_mask", "old_log_probs", "advantages"]
+    if "rollout_is_weights" in data:
+        fields.append("rollout_is_weights")
+    if "ref_log_prob" in data:
+        fields.append("ref_log_prob")
+    data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
@@ -117,6 +113,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
+    policy_loss_kwargs = {"sc_correction": sc_outputs["sc_correction"]} if sc_outputs else {}
     pg_loss, pg_metrics = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
@@ -125,10 +122,41 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        **policy_loss_kwargs,
     )
 
+    # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
+    # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
+
     metrics.update(pg_metrics)
-    metrics["actor/pg_loss"] = pg_loss.detach().item()
+    metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
+    if sc_outputs:
+        for key in (
+            "sc_sampler_head_mass",
+            "sc_train_head_mass",
+            "sc_support_aligned",
+            "sc_sampler_tail_mass",
+            "sc_support_unknown",
+        ):
+            if key not in sc_outputs:
+                continue
+            if key in ("sc_support_aligned", "sc_sampler_tail_mass", "sc_support_unknown"):
+                # Sum globally normalized token contributions across microbatches; the
+                # worker's DP mean then yields a token-weighted fraction, even for uneven rows.
+                global_tokens = config.global_batch_info["batch_num_tokens"]
+                value = agg_loss(
+                    sc_outputs[key],
+                    response_mask,
+                    "token-mean",
+                    dp_size=config.global_batch_info["dp_size"],
+                    batch_num_tokens=global_tokens,
+                )
+                aggregation = AggregationType.SUM if global_tokens is not None else AggregationType.MEAN
+            else:
+                value = masked_mean(sc_outputs[key], response_mask)
+                aggregation = AggregationType.MEAN
+            metrics[f"actor/{key}"] = Metric(value=value, aggregation=aggregation)
     policy_loss = pg_loss
 
     # add entropy loss
@@ -138,6 +166,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         )
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
+        metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
 
     # add kl loss
     if config.use_kl_loss:
@@ -149,7 +178,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         )
 
         policy_loss += kl_loss * config.kl_loss_coef
-        metrics["kl_loss"] = kl_loss.detach().item()
+        metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
 
     return policy_loss, metrics
@@ -167,8 +196,29 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     Returns:
         value loss
     """
-    vpreds = _slice_response_from_unpad_output(model_output["values"], data)  # (bsz, response_length)
+    vpreds = no_padding_2_padding(model_output["values"], data)  # (bsz, response_length)
 
+    # Normalize the value loss over the global mini-batch (dp_size / batch_num_tokens /
+    # global_batch_size) instead of the local micro-batch, so the accumulated critic gradient is
+    # invariant to how the mini-batch is split into micro-batches (as the actor's ppo_loss does).
+    dp_size = data["dp_size"]
+    batch_num_tokens = data["batch_num_tokens"]
+    global_batch_size = data["global_batch_size"]
+
+    # When the loss is normalized over the global batch, each micro-batch contributes a partial sum,
+    # so the loss metric must be aggregated with SUM to reflect the global-batch mean.
+    if (
+        dp_size > 1
+        or batch_num_tokens is not None
+        or global_batch_size is not None
+        or config.loss_scale_factor is not None
+    ):
+        metric_aggregation = AggregationType.SUM
+    else:
+        metric_aggregation = AggregationType.MEAN
+
+    # select fields and convert to padded tensor
+    data = data.select("values", "returns", "response_mask").to_padded_tensor()
     values = data["values"]
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)
@@ -180,16 +230,16 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
         response_mask=response_mask,
         cliprange_value=config.cliprange_value,
         loss_agg_mode=config.loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+        loss_scale_factor=config.loss_scale_factor,
     )
 
-    metrics = {}
-
-    metrics.update(
-        {
-            "critic/vf_loss": vf_loss.detach().item(),
-            "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
-        }
-    )
+    metrics = {
+        "critic/vf_loss": Metric(value=vf_loss, aggregation=metric_aggregation),
+        "critic/vf_clipfrac": vf_clipfrac.detach().item(),
+        "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+    }
 
     return vf_loss, metrics

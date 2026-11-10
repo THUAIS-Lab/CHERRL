@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import torch
 from transformers import PretrainedConfig
 
@@ -21,7 +23,9 @@ _DEVICE_FLOPS = {
     "CPU": 448e9,
     "GB200": 2.5e15,
     "B200": 2.25e15,
-    "MI300X": 1336e12,
+    "MI300X": 1307e12,
+    "MI350X": 2300e12,
+    "MI355X": 2500e12,
     "H100": 989e12,
     "H800": 989e12,
     "H200": 989e12,
@@ -33,8 +37,15 @@ _DEVICE_FLOPS = {
     "L20": 119.5e12,
     "H20": 148e12,
     "910B": 354e12,
+    "A2G3": 354e12,
+    "Ascend950DT": 432e12,
     "Ascend910": 354e12,
     "RTX 3070 Ti": 21.75e12,
+    "TPU v7x": 1153.5e12,
+    "TPU v7": 1153.5e12,
+    "TPU v6e": 918e12,
+    "TPU v5p": 459e12,
+    "TPU v5e": 197e12,
 }
 
 
@@ -68,10 +79,10 @@ def get_device_flops(unit="T", device_name=None):
     # pass device_name is for testing purpose only
     if device_name is None:
         device = get_torch_device()
-        if device == torch.cpu:
+        if device == torch.cpu or (hasattr(device, "is_available") and not device.is_available()):
             device_name = "CPU"
         else:
-            device_name = get_torch_device().get_device_name()
+            device_name = device.get_device_name() or ""
 
     flops = float("inf")  # INF flops for unkown gpu type
 
@@ -110,10 +121,247 @@ def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
     seqlen_square_sum = 0
     for seqlen in batch_seqlens:
         seqlen_square_sum += seqlen * seqlen
-    attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
     # all_layer & all_token fwd & bwd flops
     flops_all_token = dense_N_flops + attn_qkv_flops
+    flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+    return flops_achieved
+
+
+def _estimate_qwen3_vl_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
+    hidden_size = config.text_config.hidden_size
+    vocab_size = config.text_config.vocab_size
+    num_hidden_layers = config.text_config.num_hidden_layers
+    num_key_value_heads = config.text_config.num_key_value_heads
+    num_attention_heads = config.text_config.num_attention_heads
+    intermediate_size = config.text_config.intermediate_size
+
+    head_dim = hidden_size // num_attention_heads
+    q_size = num_attention_heads * head_dim
+    k_size = num_key_value_heads * head_dim
+    v_size = num_key_value_heads * head_dim
+
+    # non-attn per layer parm
+    mlp_N = hidden_size * intermediate_size * 3
+    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    # non-attn all_layer parm
+    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    # non-attn all_layer & all_token fwd & bwd flops
+    dense_N_flops = 6 * dense_N * tokens_sum
+
+    # qwen3_vl uses deepstack to merge visual embeds and text embeds, but it has no tensor operation.
+
+    # attn all_layer & all_token fwd & bwd flops
+    seqlen_square_sum = 0
+    for seqlen in batch_seqlens:
+        seqlen_square_sum += seqlen * seqlen
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+    # vit flops
+    images_seqlens = kargs.get("images_seqlens", None)
+    if images_seqlens is not None:
+        vit_flops = _estimate_qwen3_vit_flop(images_seqlens, config.vision_config)
+    else:
+        vit_flops = 0
+
+    # all_layer & all_token fwd & bwd flops
+    flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
+    flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+    return flops_achieved
+
+
+def _estimate_qwen3_vl_moe_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
+    hidden_size = config.text_config.hidden_size
+    vocab_size = config.text_config.vocab_size
+    num_hidden_layers = config.text_config.num_hidden_layers
+    num_key_value_heads = config.text_config.num_key_value_heads
+    num_attention_heads = config.text_config.num_attention_heads
+    moe_intermediate_size = config.text_config.moe_intermediate_size
+    moe_num_expert = config.text_config.num_experts
+    moe_topk = config.text_config.num_experts_per_tok
+
+    head_dim = getattr(
+        config.text_config, "head_dim", config.text_config.hidden_size // config.text_config.num_attention_heads
+    )
+    q_size = num_attention_heads * head_dim
+    k_size = num_key_value_heads * head_dim
+    v_size = num_key_value_heads * head_dim
+
+    # non-attn per layer parm
+    moe_gata_N = hidden_size * moe_num_expert
+    # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
+    moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
+    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    # non-attn all_layer parm
+    moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + emd_and_lm_head_N
+    # non-attn all_layer & all_token fwd & bwd flops
+    dense_N_flops = 6 * moe_N * tokens_sum
+
+    # attn all_layer & all_token fwd & bwd flops
+    seqlen_square_sum = 0
+    for seqlen in batch_seqlens:
+        seqlen_square_sum += seqlen * seqlen
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+    # vit flops
+    images_seqlens = kargs.get("images_seqlens", None)
+    if images_seqlens is not None:
+        vit_flops = _estimate_qwen3_vit_flop(images_seqlens, config.vision_config)
+    else:
+        vit_flops = 0
+
+    # all_layer & all_token fwd & bwd flops
+    flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
+    flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+    return flops_achieved
+
+
+def _estimate_qwen3_vit_flop(images_seqlens, config):
+    """
+    Estimate the FLOPS of the vision encoder for Qwen3-VL
+    """
+
+    if config is None:
+        return 0
+    tokens_sum = sum(images_seqlens)
+
+    num_heads = config.num_heads
+    depth = config.depth
+
+    dim = config.hidden_size
+    mlp_hidden_dim = config.intermediate_size
+    out_hidden_size = config.out_hidden_size
+
+    spatial_merge_size = config.spatial_merge_size
+
+    head_dim = dim // num_heads
+
+    # every vision token's patch_embed comes from a conv of (C, T, H, W) -> (dim,)
+    patch_embed_N = dim * config.in_channels * config.temporal_patch_size * config.patch_size * config.patch_size
+    # Qwen3 VL vision mlp does not use GLU, thus 2.
+    mlp_N = dim * mlp_hidden_dim * 2
+    attn_linear_N = dim * (4 * dim)  # qkv and output proj
+    merger_N = (out_hidden_size + (dim * (spatial_merge_size**2))) * (dim * (spatial_merge_size**2))
+
+    # Qwen3 VL uses deep stack, one merger for every deepstack layer
+    if getattr(config, "deepstack_visual_indexes", None) is not None:
+        deepstack_merger_N = merger_N * len(config.deepstack_visual_indexes)
+    else:
+        deepstack_merger_N = 0
+    # non-attn all_layer parm
+    dense_N = patch_embed_N + (mlp_N + attn_linear_N) * depth + deepstack_merger_N + merger_N
+
+    # non-attn all_layer & all_token fwd & bwd flops
+    dense_N_flops = 6 * dense_N * tokens_sum
+
+    # In Qwen3 VL, full attention is used in all vision layers.
+    full_attn_layer_num = depth
+
+    # full attn layer & all_token fwd & bwd flops
+    seqlen_square_sum = 0
+    for seqlen in images_seqlens:
+        seqlen_square_sum += seqlen * seqlen
+    attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
+
+    vit_flops = dense_N_flops + attn_qkv_flops
+
+    return vit_flops
+
+
+def _count_qwen3_5_layer_types(config):
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        num_full_attn_layers = sum(layer_type == "full_attention" for layer_type in layer_types)
+        num_linear_attn_layers = sum(layer_type == "linear_attention" for layer_type in layer_types)
+        return num_full_attn_layers, num_linear_attn_layers
+
+    full_attention_interval = getattr(config, "full_attention_interval", 4)
+    num_full_attn_layers = sum(
+        not bool((layer_idx + 1) % full_attention_interval) for layer_idx in range(config.num_hidden_layers)
+    )
+    return num_full_attn_layers, config.num_hidden_layers - num_full_attn_layers
+
+
+def _compute_qwen3_5_hybrid_attn_params(config):
+    hidden_size = config.hidden_size
+    num_attention_heads = config.num_attention_heads
+    num_key_value_heads = config.num_key_value_heads
+    head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
+
+    q_size = num_attention_heads * head_dim
+    k_size = num_key_value_heads * head_dim
+    v_size = num_key_value_heads * head_dim
+
+    num_full_attn_layers, num_linear_attn_layers = _count_qwen3_5_layer_types(config)
+
+    # Qwen3.5 full attention q_proj also emits a sigmoid gate, so q_proj is 2x the query size.
+    full_attn_linear_N = hidden_size * (2 * q_size + k_size + v_size + q_size)
+
+    linear_k_size = config.linear_num_key_heads * config.linear_key_head_dim
+    linear_v_size = config.linear_num_value_heads * config.linear_value_head_dim
+    linear_attn_linear_N = hidden_size * (2 * linear_k_size + 3 * linear_v_size + 2 * config.linear_num_value_heads)
+    conv_N = config.linear_conv_kernel_dim * (2 * linear_k_size + linear_v_size)
+
+    attn_linear_N = full_attn_linear_N * num_full_attn_layers
+    attn_linear_N += (linear_attn_linear_N + conv_N) * num_linear_attn_layers
+
+    return attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads
+
+
+def _compute_qwen3_5_gdn_recurrence_flops(config, tokens_sum, num_linear_attn_layers):
+    return (
+        15
+        * config.linear_key_head_dim
+        * config.linear_value_head_dim
+        * config.linear_num_value_heads
+        * tokens_sum
+        * num_linear_attn_layers
+    )
+
+
+def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    # qwen3_5 and qwen3_5_moe use text_config and vision_config for the LLM and ViT parts;
+    # text-only checkpoints (qwen3_5_text, qwen3_5_moe_text) place text attributes at the top level.
+    text_config = getattr(config, "text_config", None) or config
+    hidden_size = text_config.hidden_size
+    vocab_size = text_config.vocab_size
+    num_hidden_layers = text_config.num_hidden_layers
+
+    attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads = (
+        _compute_qwen3_5_hybrid_attn_params(text_config)
+    )
+
+    if getattr(text_config, "num_experts", None) is not None:
+        moe_gate_N = hidden_size * text_config.num_experts
+        moe_expertmlp_N = hidden_size * text_config.moe_intermediate_size * text_config.num_experts_per_tok * 3
+        moe_sharedexpertmlp_N = hidden_size * text_config.shared_expert_intermediate_size * 3
+        moe_sharedexpert_gate_N = hidden_size
+        mlp_N = (moe_gate_N + moe_expertmlp_N + moe_sharedexpertmlp_N + moe_sharedexpert_gate_N) * num_hidden_layers
+    else:
+        mlp_N = hidden_size * text_config.intermediate_size * 3 * num_hidden_layers
+
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    dense_N_flops = 6 * (mlp_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
+
+    seqlen_square_sum = 0
+    for seqlen in batch_seqlens:
+        seqlen_square_sum += seqlen * seqlen
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
+
+    gdn_recurrence_flops = _compute_qwen3_5_gdn_recurrence_flops(text_config, tokens_sum, num_linear_attn_layers)
+
+    images_seqlens = kargs.get("images_seqlens", None)
+    if images_seqlens is not None:
+        vit_flops = _estimate_qwen3_vit_flop(images_seqlens, getattr(config, "vision_config", None))
+    else:
+        vit_flops = 0
+
+    flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops + vit_flops
     flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
     return flops_achieved
 
@@ -161,7 +409,10 @@ def _estimate_deepseek_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
     for seqlen in batch_seqlens:
         seqlen_square_sum += seqlen * seqlen * num_hidden_layers
 
-    attn_qkv_flops = 12 * seqlen_square_sum * q_head_dim * num_query_heads
+    # Core attention FLOPS for MLA with causal mask:
+    # Q @ K^T: 3 * 2 * seq^2 * q_head_dim * num_heads / 2 (causal)
+    # attn @ V: 3 * 2 * seq^2 * v_head_dim * num_heads / 2 (causal)
+    attn_qkv_flops = 3 * seqlen_square_sum * (q_head_dim + config.v_head_dim) * num_query_heads
     # all_layer & all_token fwd & bwk flops
     flops_all_token = dense_N_flops + attn_qkv_flops
     flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
@@ -198,7 +449,7 @@ def _estimate_qwen2_moe_flops(config, tokens_sum, batch_seqlens, delta_time):
     seqlen_square_sum = 0
     for seqlen in batch_seqlens:
         seqlen_square_sum += seqlen * seqlen
-    attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
     # all_layer & all_token fwd & bwd flops
     flops_all_token = dense_N_flops + attn_qkv_flops
@@ -266,7 +517,7 @@ def _estimate_gemma3_flops(config, tokens_sum, batch_seqlens, delta_time):
             seqlen_square_sum += seqlen * seqlen
         seqlen_square_sum *= num_hidden_layers
 
-    attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads
 
     # all_layer & all_token fwd & bwd flops
     flops_all_token = dense_N_flops + attn_qkv_flops
@@ -306,7 +557,7 @@ def _estimate_apertus_flops(config, tokens_sum, batch_seqlens, delta_time):
     seqlen_square_sum = 0
     for seqlen in batch_seqlens:
         seqlen_square_sum += seqlen * seqlen
-    attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
     # all_layer & all_token fwd & bwd flops
     flops_all_token = dense_N_flops + attn_qkv_flops
@@ -377,7 +628,7 @@ def _estimate_gpt_oss_flops(config, tokens_sum, batch_seqlens, delta_time):
             seqlen_square_sum += seqlen * seqlen
         seqlen_square_sum *= num_hidden_layers
 
-    attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads
 
     # Total FLOPs
     flops_all_token = dense_N_flops + attn_qkv_flops
@@ -389,16 +640,61 @@ def _estimate_unknown_flops(config, tokens_sum, batch_seqlens, delta_time):
     return 0
 
 
+def _estimate_hy_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
+    hidden_size = config.hidden_size
+    vocab_size = config.vocab_size
+    # Hy V3 uses expert_hidden_dim as the legacy alias for moe_intermediate_size.
+    # Prefer the standard name and fall back.
+    moe_intermediate_size = getattr(config, "moe_intermediate_size", None)
+    if moe_intermediate_size is None:
+        moe_intermediate_size = config.expert_hidden_dim
+    num_hidden_layers = config.num_hidden_layers
+    num_experts = config.num_experts
+    moe_topk = config.num_experts_per_tok
+    share_expert_num = config.num_shared_experts
+
+    num_attention_heads = config.num_attention_heads
+    num_key_value_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+    q_size = num_attention_heads * head_dim
+    k_size = num_key_value_heads * head_dim
+    v_size = num_key_value_heads * head_dim
+
+    # non-attn per layer parm: router gate + moe experts (topk routed + shared)
+    moe_gata_N = hidden_size * num_experts
+    moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 3
+    moe_mlp_N = moe_gata_N + moe_expertmlp_N
+
+    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+
+    dense_N = (moe_mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    dense_N_flops = 6 * dense_N * tokens_sum
+
+    seqlen_square_sum = 0
+    for seqlen in batch_seqlens:
+        seqlen_square_sum += seqlen * seqlen
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+    flops_all_token = dense_N_flops + attn_qkv_flops
+    flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+    return flops_achieved
+
+
 ESTIMATE_FUNC = {
     "qwen2": _estimate_qwen2_flops,
     "llama": _estimate_qwen2_flops,
     "qwen2_moe": _estimate_qwen2_moe_flops,
-    "qwen2_vl": _estimate_qwen2_flops,
-    "qwen2_5_vl": _estimate_qwen2_flops,
+    "qwen2_vl": _estimate_qwen3_vl_flops,
+    "qwen2_5_vl": _estimate_qwen3_vl_flops,
     "qwen3": _estimate_qwen2_flops,
     "qwen3_moe": _estimate_qwen2_moe_flops,
-    "qwen3_vl": _estimate_qwen2_flops,
-    "qwen3_vl_moe": _estimate_qwen2_moe_flops,
+    "qwen3_vl": _estimate_qwen3_vl_flops,
+    "qwen3_vl_moe": _estimate_qwen3_vl_moe_flops,
+    "qwen3_5": _estimate_qwen3_5_flops,
+    "qwen3_5_text": _estimate_qwen3_5_flops,
+    "qwen3_5_moe": _estimate_qwen3_5_flops,
+    "qwen3_5_moe_text": _estimate_qwen3_5_flops,
     "deepseek_v3": _estimate_deepseek_v3_flops,
     "minicpmv": _estimate_qwen2_flops,
     "minicpmo": _estimate_qwen2_flops,
@@ -408,6 +704,8 @@ ESTIMATE_FUNC = {
     "apertus": _estimate_apertus_flops,
     "glm4v": _estimate_qwen2_flops,
     "gpt_oss": _estimate_gpt_oss_flops,
+    "mimo": _estimate_qwen2_flops,
+    "hy_v3": _estimate_hy_v3_flops,
 }
 
 
@@ -429,10 +727,10 @@ class FlopsCounter:
                 f"zero."
             )
 
-        self.config = getattr(config, "text_config", config)
+        self.config = config
 
     # TODO: actually we can make this a static method
-    def estimate_flops(self, batch_seqlens, delta_time):
+    def estimate_flops(self, batch_seqlens, delta_time, **kargs):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
 
@@ -447,6 +745,10 @@ class FlopsCounter:
         """
         tokens_sum = sum(batch_seqlens)
         func = ESTIMATE_FUNC.get(self.config.model_type, _estimate_unknown_flops)
-        estimated_flops = func(self.config, tokens_sum, batch_seqlens, delta_time)
+        sig = inspect.signature(func)
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            estimated_flops = func(self.config, tokens_sum, batch_seqlens, delta_time, **kargs)
+        else:
+            estimated_flops = func(self.config, tokens_sum, batch_seqlens, delta_time)
         promised_flops = get_device_flops()
         return estimated_flops, promised_flops

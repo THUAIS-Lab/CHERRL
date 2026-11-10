@@ -26,196 +26,171 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
-import getpass
 import logging
 import os
-from dataclasses import asdict
-from types import MethodType
-from typing import Any, Generator
+import time
+from typing import Any, Generator, Optional
 
-import cloudpickle as pickle
 import ray
 import torch
-import torch.distributed
-import zmq
-import zmq.asyncio
-from filelock import FileLock
 from torch.distributed.device_mesh import DeviceMesh
-from vllm.config import LoRAConfig
-
-from verl.utils.ray_utils import get_event_loop
-
-try:
-    from vllm.worker.worker_base import WorkerWrapperBase
-except ModuleNotFoundError:
-    # https://github.com/vllm-project/vllm/commit/6a113d9aed8221a9c234535958e70e34ab6cac5b
-    from vllm.v1.worker.worker_base import WorkerWrapperBase
-
-from packaging import version as vs
 
 from verl import DataProto
-from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
-from verl.utils.device import is_npu_available
-from verl.utils.distributed import initialize_global_process_group_ray
-from verl.utils.ray_utils import ray_noset_visible_devices
-from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
-from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+from verl.third_party.vllm import VLLM_SLEEP_LEVEL
+from verl.utils.device import is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
-from verl.workers.rollout.vllm_rollout.utils import (
-    VLLM_LORA_INT_ID,
-    VLLM_LORA_NAME,
-    VLLM_LORA_PATH,
-    get_vllm_max_lora_rank,
-)
+from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
 
 logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-# TODO
-# 1. support pp in vllm
-# 2. passing tokenizer is not necessary? no encoding/decoding is happending here
-# 3. simplify init logics
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-if is_version_ge(pkg="vllm", minver="0.7.3"):
-    VLLMHijack.hijack()
-
-
-def _check_vllm_version_for_sleep_level():
-    # https://github.com/vllm-project/vllm/issues/25171
-    minver = "0.11.0"
-    current_version = get_version("vllm")
-    if not current_version:
-        logger.warning("Could not determine vLLM version, assuming an older version for sleep_level configuration.")
-        return False
-    return vs.parse(current_version) >= vs.parse(minver)
-
-
-# https://github.com/vllm-project/vllm/issues/13175
-def _monkey_patch_compute_logits(model, vocab_size: int):
-    original_compute_logits = model.compute_logits
-
-    def compute_logits(
-        self,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        logits = original_compute_logits(*args, **kwargs)
-        logits[..., vocab_size:] = float("-inf")
-        return logits
-
-    model.compute_logits = MethodType(compute_logits, model)
-
-
-class vLLMAsyncRollout(BaseRollout):
-    """vLLMAsyncRollout is a thin wrapper of WorkerWrapperBase, which is engine in single worker process."""
+class ServerAdapter(BaseRollout):
+    """
+    vLLM server adapter used in native async mode, serve as a client to request vLLM server
+    to resume/release/update weights and kv_cache.
+    """
 
     def __init__(
         self,
         config: RolloutConfig,
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
+        replica_rank: int = -1,
     ):
         super().__init__(config, model_config, device_mesh)
-        self.tokenizer = self.model_config.tokenizer
-        self.inference_engine: WorkerWrapperBase = None
-        self.address = self._init_zeromq()
-        self.lora_config = (
-            {"max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank)}
-            if self.model_config.lora_rank > 0
-            else {}
-        )
+        self.server_handle: ray.actor.ActorHandle = None
 
-        if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
+        rank = int(os.environ["RANK"])
+        local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+        # PD asymmetric layout inflates per-replica footprint; must match
+        # llm_server.py:_initialize_llm_servers or trainer-to-replica mapping breaks.
+        prefill_tp = self.config.tensor_model_parallel_size
+        disagg = getattr(self.config, "disaggregation", None)
+        if disagg is not None and getattr(disagg, "enabled", False):
+            decode_tp = (
+                disagg.decode_tensor_model_parallel_size
+                if disagg.decode_tensor_model_parallel_size is not None
+                else prefill_tp
+            )
+            per_replica = prefill_tp * disagg.prefill_replicas + decode_tp * disagg.decode_replicas
+        else:
+            decode_tp = prefill_tp
+            per_replica = prefill_tp
+        rollout_world_size = per_replica * self.config.data_parallel_size * self.config.pipeline_model_parallel_size
+        if replica_rank == -1:
+            self.replica_rank = rank // rollout_world_size
+        else:
+            self.replica_rank = replica_rank
+        self.rollout_rank = rank % rollout_world_size
+        self.node_rank = self.rollout_rank // local_world_size
+
+        # Map each trainer rank to its co-located vLLM server so weight-update
+        # IPC handles stay on the GPU where they were created. Offset math
+        # assumes prefill_replicas == 1 (enforced by vLLMPDReplica); if that
+        # ever lifts, update both this block and vLLMPDReplica.launch_servers.
+        self._pd_role: Optional[str] = None
+        self._pd_server_index: Optional[int] = None
+        self._pd_tp_local_rank: Optional[int] = None
+        if disagg is not None and getattr(disagg, "enabled", False):
+            footprint = prefill_tp + disagg.decode_replicas * decode_tp
+            local = self.rollout_rank % footprint
+            if local < prefill_tp:
+                self._pd_role = "prefill"
+                self._pd_server_index = 0
+                self._pd_tp_local_rank = local
+            else:
+                off = local - prefill_tp
+                self._pd_role = "decode"
+                self._pd_server_index = off // decode_tp
+                self._pd_tp_local_rank = off % decode_tp
+            # Each role's TP-rank-0 owns the adapter (vs colocated where every
+            # rollout_rank=0 owns it). One log line per PD rank at startup so
+            # a deadlock report can be traced back to the role mapping.
+            self._has_server = self._pd_tp_local_rank == 0
+            logger.info(
+                "vllm PD ServerAdapter: rank=%d replica=%d rollout=%d role=%s server_idx=%s tp_local=%s has_server=%s",
+                rank,
+                self.replica_rank,
+                self.rollout_rank,
+                self._pd_role,
+                self._pd_server_index,
+                self._pd_tp_local_rank,
+                self._has_server,
+            )
+        else:
+            self._has_server = self.rollout_rank == 0
+
+        if config.layered_summon:
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
             self.sleep_level = 1
         else:
             self.sleep_level = VLLM_SLEEP_LEVEL
 
-    def _init_zeromq(self) -> str:
-        tensor_parallel_size = self.config.tensor_model_parallel_size
+        # Use replica_rank + node-local rank to form ZMQ handle instead of GPU UUID,
+        # because CheckpointEngineWorker and vLLM worker may see different GPU UUIDs
+        # when CUDA_VISIBLE_DEVICES differs between processes (common on ROCm/AMD).
+        # Must use node-local rank (not rollout_rank) so it matches vLLM worker's
+        # local_rank on every node. Include replica_rank to avoid collisions when
+        # multiple replicas share a node, and the Ray job id so two independent
+        # verl jobs on the same host (or a new run after a crashed one with a
+        # stale socket file) cannot collide on the shared /tmp namespace.
+        local_rank = self.rollout_rank % local_world_size
+        job_id = ray.get_runtime_context().get_job_id()
+        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
-        # single node: ipc, multi nodes: tcp
-        local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
-        socket_type = "ipc" if tensor_parallel_size <= local_world_size else "tcp"
+        self.use_shm = not is_support_ipc()
+        self._delta_weight_transfer_engine_initialized = False
+        if self.use_shm:
+            logger.warning(
+                "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
+                "which may cause performance degradation. If you are using Ascend NPUs, please ensure that "
+                "your software and CANN toolkit versions meet the requirements for IPC support. (Ascend HDK version "
+                ">= 25.3.rc1 and CANN toolkit version >= 8.3.RC1)"
+            )
 
-        # File lock to prevent multiple workers listen to same port
-        with FileLock(f"/tmp/verl_vllm_zmq_{getpass.getuser()}.lock"):
-            context = zmq.asyncio.Context()
-            self.socket = context.socket(zmq.REP)
-            if socket_type == "ipc":
-                pid = os.getpid()
-                address = f"ipc:///tmp/verl_vllm_zmq_{pid}_{getpass.getuser()}.ipc"
+    def _ensure_server_handle(self) -> bool:
+        """Lazy-init server handle. Returns False if this rank should not proceed."""
+        if not self._has_server:
+            return False
+        # Lazy init http server adapter because http server is launched after hybrid engine.
+        if self.server_handle is None:
+            prefix = self._get_server_name_prefix()
+            if self._pd_role == "prefill":
+                actor_name = f"{prefix}server_{self.replica_rank}_0"
+            elif self._pd_role == "decode":
+                actor_name = f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}"
             else:
-                ip = ray.util.get_node_ip_address().strip("[]")
-                port, sock = get_free_port(ip)
-                if is_valid_ipv6_address(ip):
-                    address = f"tcp://[{ip}]:{port}"
-                    self.socket.setsockopt(zmq.IPV6, 1)
-                else:
-                    address = f"tcp://{ip}:{port}"
-            self.socket.bind(address)
+                actor_name = f"{prefix}server_{self.replica_rank}_{self.node_rank}"
+            self.server_handle = ray.get_actor(actor_name)
+        return True
 
-        loop = get_event_loop()
-        self.zmq_loop_task = loop.create_task(self._loop_forever())
+    async def _execute_method(
+        self,
+        method: str,
+        non_block: bool = False,
+        timeout: Optional[float] = None,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+    ) -> Any:
+        """Execute method on inference engine via ray.
 
-        return address
+        Args:
+            method: The method name to execute on the server.
+            non_block: If True, execute the method asynchronously and return immediately.
+            timeout: Timeout for the collective_rpc call.
+            args: Positional arguments for the method.
+            kwargs: Keyword arguments for the method.
 
-    async def _loop_forever(self):
-        while True:
-            try:
-                message = await self.socket.recv()
-                method, args, kwargs = pickle.loads(message)
-                result = await self._execute_method(method, *args, **kwargs)
-                await self.socket.send(pickle.dumps(result))
-            except Exception as e:
-                logger.exception(f"vLLMAsyncRollout _loop_forever error: {e}")
-                await self.socket.send(pickle.dumps(e))
-                break
+        Returns:
+            The result of the method execution, or None if non_block=True.
+        """
+        if not self._ensure_server_handle():
+            return None
 
-    def _init_worker(self, all_kwargs: list[dict[str, Any]]):
-        """Initialize worker engine."""
-        if not torch.distributed.is_initialized():
-            initialize_global_process_group_ray()
-        all_kwargs[0]["rank"] = int(os.environ["RANK"])
-        device_name = "NPU" if is_npu_available else "GPU"
-        all_kwargs[0]["local_rank"] = (
-            0
-            if not ray_noset_visible_devices()
-            else int(ray.get_runtime_context().get_accelerator_ids()[device_name][0])
-        )
-        self.vllm_config = all_kwargs[0]["vllm_config"]
-        if self.lora_config:
-            lora_dtype = getattr(torch, self.config.dtype)
-            self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
-        if self.config.quantization is not None:
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao"]
-            if self.config.quantization not in _SUPPORTED_QUANTIZATION:
-                raise ValueError(
-                    f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {self.config.quantization}"
-                )
-
-            if self.config.quantization == "fp8":
-                # Apply vllm fp8 patches
-                # Will remove the patch after vllm support on-the-fly quant for rollout natively.
-                apply_vllm_fp8_patches()
-
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
-        self.inference_engine.init_worker(all_kwargs)
-
-    def _load_model(self, *args, **kwargs):
-        self.inference_engine.load_model(*args, **kwargs)
-        _monkey_patch_compute_logits(self.inference_engine.worker.model_runner.model, len(self.tokenizer))
-
-    async def _execute_method(self, method: str | bytes, *args, **kwargs):
-        if method == "init_worker":
-            return self._init_worker(*args, **kwargs)
-        elif method == "load_model":
-            return self._load_model(*args, **kwargs)
-        else:
-            return self.inference_engine.execute_method(method, *args, **kwargs)
+        future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
+        return future if non_block else await future
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
@@ -223,56 +198,134 @@ class vLLMAsyncRollout(BaseRollout):
         Args:
             tags: weights or kv_cache.
         """
-        if self.config.free_cache_engine:
-            self.inference_engine.wake_up(tags=tags)
+        if self.config.free_cache_engine and self._ensure_server_handle():
+            await self.server_handle.wake_up.remote(tags=tags)
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
-        if self.config.free_cache_engine:
-            self.inference_engine.sleep(level=self.sleep_level)
+        if self.config.free_cache_engine and self._ensure_server_handle():
+            await self.server_handle.sleep.remote()
 
-    async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
-        """Update the weights of the rollout model.
+    @torch.no_grad()
+    async def update_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int = None,
+        wire_format: str = "named_tensors",
+        **kwargs,
+    ):
+        """Update rollout weights from full tensors or DeltaFlush payloads.
 
-        Args:
-            weights: A generator that yields the name of the weight tensor and the tensor itself.
+        Full-tensor updates may fall back to shared memory; delta updates
+        require colocated CUDA IPC.
         """
-        peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
-        if peft_config and base_sync_done:
-            # In async mode, make sure the old lora is removed before adding the new one
-            self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
-            weights = dict(weights)
-            lora_request = TensorLoRARequest(
-                lora_name=VLLM_LORA_NAME,
-                lora_int_id=VLLM_LORA_INT_ID,
-                lora_path=VLLM_LORA_PATH,
-                peft_config=asdict(peft_config),
-                lora_tensors=weights,
+        if wire_format == "delta_flush":
+            return await self._update_delta_weights(weights, global_steps=global_steps)
+        assert wire_format == "named_tensors", (
+            f"vLLM rollout supports wire_format='named_tensors' or 'delta_flush'; got {wire_format!r}"
+        )
+        start_time = time.time()
+
+        future = await self._execute_method(
+            "update_weights_from_ipc",
+            non_block=True,
+            kwargs={**kwargs, "use_shm": self.use_shm},
+        )
+
+        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+        sender = BucketedWeightSender(
+            zmq_handle=self.zmq_handle,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=self.use_shm,
+        )
+        await sender.async_send_weights(weights)
+
+        if future is not None:
+            await future
+
+        # reset caches after updating weights
+        if self._has_server:
+            await self.server_handle.clear_kv_cache.remote()
+            if global_steps is not None:
+                await self.server_handle.set_global_steps.remote(global_steps)
+
+        if self.replica_rank == 0 and self.rollout_rank == 0:
+            logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+
+    async def _update_delta_weights(
+        self,
+        weights,
+        *,
+        global_steps: int | None,
+    ) -> None:
+        """Send one delta weight update as a stream of DeltaFlush payloads."""
+
+        from verl.workers.rollout.utils import ensure_async_iterator
+
+        if self.use_shm:
+            raise NotImplementedError("delta_sharded with vLLM requires colocated CUDA IPC")
+
+        flushes = ensure_async_iterator(weights)
+        try:
+            first_item = await anext(flushes)
+        except StopAsyncIteration:
+            # A steady sync with no changed BF16 values sends only a terminal
+            # marker: weights are unchanged, so advance the step tag without
+            # touching the transfer engine or the KV cache.
+            if global_steps is not None and self._ensure_server_handle():
+                await self.server_handle.set_global_steps.remote(global_steps)
+            return
+
+        first_named_tensors, saw_last = first_item
+        if not self._delta_weight_transfer_engine_initialized:
+            await self._execute_method(
+                "init_weight_transfer_engine",
+                kwargs={"init_info": {}},
             )
-            self.inference_engine.worker.add_lora(lora_request)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
-        else:
-            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+            self._delta_weight_transfer_engine_initialized = True
 
-            model_runner = self.inference_engine.worker.model_runner
-            model = model_runner.model
-            patch_vllm_moe_model_weight_loader(model)
+        await self._execute_method("start_weight_update")
 
-            # Add the FP8 related logic here as sharding manager has been deprecated.
-            # Check if FP8 quantization is enabled and apply appropriate weight loading
-            if is_fp8_model(model_runner.vllm_config):
-                logger.info(f"FP8 model detected (async): {model_runner.vllm_config.quant_config}")
-                # Convert bf16 weights to fp8 format before loading
-                loaded_params = load_quanted_weights(weights, model_runner)
-                logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
-            else:
-                logger.info("Loading standard weights (non-FP8, async)")
-                model.load_weights(weights)
+        async def send_flush(flush_tensors: list[tuple[str, torch.Tensor]]) -> None:
+            receiver_future = await self._execute_method(
+                "update_verl_delta_weights",
+                non_block=True,
+                kwargs={"update_info": {}},
+            )
+            sender = BucketedWeightSender(
+                zmq_handle=self.zmq_handle,
+                bucket_size_mb=self.config.checkpoint_engine.update_weights_bucket_megabytes,
+                use_shm=False,
+            )
+            await sender.async_send_weights(iter(flush_tensors))
+            if receiver_future is not None:
+                await receiver_future
+
+        await send_flush(list(first_named_tensors))
+        async for named_tensors, is_last in flushes:
+            if saw_last:
+                raise ValueError("DeltaFlush stream yielded data after is_last=True")
+            saw_last = is_last
+            await send_flush(list(named_tensors))
+
+        if not saw_last:
+            raise ValueError("DeltaFlush stream ended without is_last=True")
+
+        await self._execute_method("finish_weight_update")
+
+        if self._has_server:
+            await self.server_handle.clear_kv_cache.remote()
+            if global_steps is not None:
+                await self.server_handle.set_global_steps.remote(global_steps)
+
+    def _get_server_name_prefix(self) -> str:
+        """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""
+        return f"{self.config.get('name', 'vllm')}_"
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.
 
-        Note: vLLMAsyncRollout uses async server mode and does not support synchronous
+        Note: ServerAdapter uses async server mode and does not support synchronous
         generation. Since SPMD mode was retired (PR #4411), the generation workflow
         should use the async server interface instead.
 
@@ -280,14 +333,9 @@ class vLLMAsyncRollout(BaseRollout):
             NotImplementedError: Always raised as sync generation is not supported.
         """
         raise NotImplementedError(
-            "vLLMAsyncRollout does not support synchronous generate_sequences(). "
+            "ServerAdapter does not support synchronous generate_sequences(). "
             "The vLLM SPMD mode was retired in PR #4411. For batch generation, "
-            "please use the async server interface via vLLMReplica and AsyncLLMServerManager, "
+            "please use the async server interface via vLLMReplica and LLMServerClient, "
             "or use HFRollout for synchronous generation. "
-            "See https://github.com/volcengine/verl/issues/4682 for more details."
+            "See https://github.com/verl-project/verl/issues/4682 for more details."
         )
-
-    # ==================== server mode public methods ====================
-
-    def get_zeromq_address(self):
-        return self.address

@@ -18,14 +18,27 @@ from typing import Any, Optional
 from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
-from verl.trainer.config import CheckpointConfig
+from verl.trainer.config import CheckpointConfig, RolloutCorrectionConfig
 from verl.utils.profiler.config import ProfilerConfig
 
-from .engine import FSDPEngineConfig, McoreEngineConfig
+from .engine import (
+    FSDPEngineConfig,
+    McoreEngineConfig,
+    TorchtitanEngineConfig,
+    VeOmniEngineConfig,
+)
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = [
+    "PolicyLossConfig",
+    "RouterReplayConfig",
+    "ActorConfig",
+    "FSDPActorConfig",
+    "McoreActorConfig",
+    "VeOmniActorConfig",
+    "TorchTitanActorConfig",
+]
 
 
 @dataclass
@@ -64,12 +77,15 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg'.
+        loss_mode (str): Registered policy loss name. Options: 'vanilla', 'dppo_tv', 'dppo_kl', 'gspo', 'sapo',
+            'gpg', 'clip_cov', 'kl_cov', 'geo_mean', 'dro', 'cispo', and 'bypass_mode'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        dro_beta (Optional[float]): Quadratic log-ratio penalty for DRO. Required when loss_mode is 'dro'.
+        rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
     loss_mode: str = "vanilla"
@@ -78,6 +94,8 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    dro_beta: Optional[float] = None
+    rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 
 @dataclass
@@ -99,7 +117,7 @@ class ActorConfig(BaseConfig):
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
         policy_loss (PolicyLossConfig): Configuration for policy loss computation.
         clip_ratio_c (float): Clipping ratio for critic loss.
-        loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
+        loss_agg_mode (str): Loss aggregation mode, including 'token-mean', 'token-sum', and sequence modes.
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
@@ -115,7 +133,6 @@ class ActorConfig(BaseConfig):
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
         data_loader_seed (int): Seed for data loader. If None, uses global seed.
-        router_replay (RouterReplayConfig): Configuration for router replay in MoE models.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -147,13 +164,16 @@ class ActorConfig(BaseConfig):
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
+    calculate_sum_pi_squared: bool = False
     use_kl_loss: bool = False
+    # Whether to enable PrefixGrouper-based shared-prefix forward
+    use_prefix_grouper: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
     ppo_epochs: int = 1
     shuffle: bool = False
-    data_loader_seed: int = 1
+    data_loader_seed: int = 42
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
@@ -161,7 +181,6 @@ class ActorConfig(BaseConfig):
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
-    router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -188,6 +207,7 @@ class ActorConfig(BaseConfig):
 
         valid_loss_agg_modes = [
             "token-mean",
+            "token-sum",
             "seq-mean-token-sum",
             "seq-mean-token-mean",
             "seq-mean-token-sum-norm",
@@ -241,16 +261,17 @@ class McoreActorConfig(ActorConfig):
 
     Args:
         strategy (str): Training strategy set to 'megatron' for Megatron parallelism.
-        load_weight (bool): Whether to load model weights from checkpoint.
         megatron (dict[str, Any]): Configuration for Megatron parallelism settings.
         profile (dict[str, Any]): Configuration for profiling settings.
     """
 
     strategy: str = "megatron"
-    load_weight: bool = True
+    entropy_from_logits_with_chunking: bool = False
+    entropy_from_logits_chunk_size: int = 2048
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     profile: dict[str, Any] = field(default_factory=dict)
     use_rollout_log_probs: bool = False
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""
@@ -271,6 +292,8 @@ class FSDPActorConfig(ActorConfig):
         entropy_from_logits_with_chunking (bool): Whether to compute entropy from logits
             with chunking for memory efficiency.
         entropy_checkpointing (bool): Whether to use gradient checkpointing for entropy computation.
+        pad_to_length (bool): Whether to pad every packed micro-batch to a static token count.
+            Forwarded to ``fsdp_config.pad_to_length``, which is what the engine reads.
         fsdp_config (dict[str, Any]): Configuration for FSDP settings.
         use_remove_padding (bool): Whether to remove padding tokens in inputs during training
     """
@@ -279,7 +302,9 @@ class FSDPActorConfig(ActorConfig):
     grad_clip: float = 1.0
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False
+    entropy_from_logits_chunk_size: int = 2048
     entropy_checkpointing: bool = False
+    pad_to_length: bool = False
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
     use_rollout_log_probs: bool = False
@@ -288,6 +313,10 @@ class FSDPActorConfig(ActorConfig):
         """Validate FSDP actor configuration parameters."""
         super().__post_init__()
         self.engine = self.fsdp_config
+        # Sync strategy to engine config so engine_workers can pick the right FSDP version.
+        # EngineConfig.strategy defaults to None, so without this, engine_workers.py always
+        # falls back to FSDP1 even when actor.strategy="fsdp2".
+        object.__setattr__(self.engine, "strategy", self.strategy)
 
         # backward compatibility
         if self.ulysses_sequence_parallel_size > 1:
@@ -296,9 +325,69 @@ class FSDPActorConfig(ActorConfig):
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate FSDP actor configuration with runtime parameters."""
         super().validate(n_gpus, train_batch_size, model_config)
+        if (
+            self.ulysses_sequence_parallel_size > 1
+            and model_config
+            and not model_config.get("use_remove_padding", False)
+        ):
+            raise ValueError(
+                "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
+            )
 
-        if self.strategy in {"fsdp", "fsdp2"} and self.ulysses_sequence_parallel_size > 1:
-            if model_config and not model_config.get("use_remove_padding", False):
-                raise ValueError(
-                    "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
-                )
+
+@dataclass
+class VeOmniActorConfig(ActorConfig):
+    """Configuration for VeOmni actor models.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        strategy (str): Training strategy set to 'veomni' for VeOmni parallelism.
+        veomni (dict[str, Any]): Configuration for VeOmni settings.
+        pad_to_length (bool): Whether to pad every packed micro-batch to a static token count.
+            Forwarded to ``veomni.pad_to_length``, which is what the engine reads.
+        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+    """
+
+    strategy: str = "veomni"
+    veomni: VeOmniEngineConfig = field(default_factory=VeOmniEngineConfig)
+    pad_to_length: bool = False
+    use_remove_padding: bool = False
+    use_rollout_log_probs: bool = False
+
+    def __post_init__(self):
+        """Validate VeOmni actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.veomni
+        if self.veomni.router_replay.mode != "disabled" and not self.use_remove_padding:
+            raise RuntimeError(
+                "router_replay requires use_remove_padding=True. In VeOmni engine, "
+                "the non-remove-padding path also disables Ulysses SP slicing and "
+                "the fused-kernel log_probs path, and is not a tested production "
+                "configuration for MoE routing replay. Set "
+                "actor.use_remove_padding=True or router_replay.mode='disabled'."
+            )
+
+
+@dataclass
+class TorchTitanActorConfig(ActorConfig):
+    """Configuration for TorchTitan actor models.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        strategy (str): Training strategy set to 'torchtitan' for TorchTitan parallelism.
+        torchtitan (TorchtitanEngineConfig): Configuration for TorchTitan engine settings.
+        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+        use_rollout_log_probs (bool): Whether to use log probabilities from rollout engine
+    """
+
+    strategy: str = "torchtitan"
+    torchtitan: TorchtitanEngineConfig = field(default_factory=TorchtitanEngineConfig)
+    use_remove_padding: bool = False
+    use_rollout_log_probs: bool = False
+
+    def __post_init__(self):
+        """Validate TorchTitan actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.torchtitan

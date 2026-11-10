@@ -11,15 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
-from omegaconf import MISSING
+from omegaconf import MISSING, DictConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
+from verl.workers.config.disaggregation import DisaggregationConfig
+from verl.workers.config.model import MtpConfig
 
 __all__ = [
     "SamplingConfig",
@@ -30,6 +31,8 @@ __all__ = [
     "ServerConfig",
     "PrometheusConfig",
     "RolloutConfig",
+    "RolloutQuantizationConfig",
+    "CheckpointEngineConfig",
 ]
 
 
@@ -49,11 +52,11 @@ class MultiTurnConfig(BaseConfig):
     enable: bool = False
     max_assistant_turns: Optional[int] = None
     tool_config_path: Optional[str] = None
+    function_tool_path: Optional[str] = None
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1
     max_tool_response_length: int = 256
     tool_response_truncate_side: str = "middle"
-    interaction_config_path: Optional[str] = None
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
@@ -79,6 +82,8 @@ class AgentLoopConfig(BaseConfig):
 
 @dataclass
 class TraceConfig(BaseConfig):
+    project_name: Optional[str] = None
+    experiment_name: Optional[str] = None
     backend: Optional[str] = None
     token2text: bool = False
     max_samples_per_step_per_worker: Optional[int] = None
@@ -118,11 +123,82 @@ class PrometheusConfig(BaseConfig):
 
 
 @dataclass
+class CheckpointEngineConfig(BaseConfig):
+    """
+    Configuration for checkpoint engine to update weights from trainer to rollout
+    """
+
+    _mutable_fields = {"backend"}
+
+    # Backend for checkpoint engine: naive, nccl, nixl, hccl
+    backend: Optional[str] = "naive"
+    # Bucket size in MB to transfer multiple weights at one time
+    update_weights_bucket_megabytes: int = 2048
+    # Additional keyword arguments for checkpoint engine
+    engine_kwargs: dict = field(default_factory=dict)
+    # If set, this Python module is imported on every worker process before the
+    # backend is instantiated, allowing custom backends to register themselves
+    # in CheckpointEngineRegistry.
+    custom_backend_module: Optional[str] = None
+
+
+@dataclass
+class RolloutQuantizationConfig(BaseConfig):
+    """Low-precision rollout as a compressed-tensors ``quantization_config``; the trainer quantizes the weights.
+
+    Either pick compressed-tensors presets per layer kind (``linear`` / ``moe`` / ``ignore``),
+    or point ``config_file`` at a complete compressed-tensors ``quantization_config`` JSON.
+    """
+
+    # Preset for dense linear layers (attention, dense MLP, shared experts), e.g. FP8_BLOCK.
+    linear: Optional[str] = None
+    # Preset for routed experts, e.g. FP8_BLOCK.
+    moe: Optional[str] = None
+    # Activation override for the routed experts, as vLLM's quantization_config.moe.activation;
+    # moe=NVFP4 defaults to nvfp4_per_token.
+    moe_activation: Optional[str] = None
+    # Extra "re:" patterns kept in high precision.
+    ignore: list[str] = field(default_factory=list)
+    # compressed-tensors quantization_config JSON, used as is; exclusive with the fields above.
+    config_file: Optional[str] = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.linear or self.moe or self.config_file)
+
+    def build_quantization_config(self, model_path: str) -> dict[str, Any]:
+        """HF ``quantization_config`` the rollout engine starts from and the trainer quantizes refits to."""
+        from verl.utils.qat.compressed_tensors import build_compressed_tensors_config
+
+        return build_compressed_tensors_config(
+            linear=self.linear,
+            moe=self.moe,
+            ignore=self.ignore,
+            config_file=self.config_file,
+            model_path=model_path,
+            moe_activation=self.moe_activation,
+        )
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
-    _mutable_fields = {"max_model_len", "load_format"}
+    _mutable_fields = {
+        "max_model_len",
+        "max_num_batched_tokens",
+        "load_format",
+        "engine_kwargs",
+        "prompt_length",
+        "response_length",
+        "expert_parallel_size",
+        "moe_tensor_parallel_size",
+        "full_determinism",
+        "max_num_seqs",
+    }
 
     name: Optional[str] = MISSING
     mode: str = "async"
+    nnodes: int = 0
+    n_gpus_per_node: int = 8
 
     temperature: float = 1.0
     top_k: int = -1
@@ -130,6 +206,13 @@ class RolloutConfig(BaseConfig):
     do_sample: bool = True
     n: int = 1
     repetition_penalty: float = 1.0
+
+    # Whether to enable full determinism for reproducibility.
+    full_determinism: bool = False
+
+    # Random seed for rollout. Used as the seed for vLLM sampling and
+    # enable_full_determinism() when full_determinism is True.
+    seed: int = 42
 
     # Early termination threshold for multi-turn rollout in sglang.
     # Abort remaining requests when (1 - over_sample_rate) * total_requests are completed.
@@ -140,16 +223,19 @@ class RolloutConfig(BaseConfig):
 
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
+    standalone_gpu_memory_utilization: Optional[float] = None
     ignore_eos: bool = False
-    enforce_eager: bool = True
+    enforce_eager: bool = False
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
     pipeline_model_parallel_size: int = 1
+    moe_tensor_parallel_size: int = 1
     max_num_batched_tokens: int = 8192
     logprobs_mode: Optional[str] = "processed_logprobs"
+    scheduling_policy: Optional[str] = "fcfs"
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
@@ -158,6 +244,9 @@ class RolloutConfig(BaseConfig):
 
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
+
+    # Ray max_concurrency of the rollout server actor.
+    ray_actor_max_concurrency: int = 1024
 
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size: Optional[int] = None
@@ -171,6 +260,9 @@ class RolloutConfig(BaseConfig):
     engine_kwargs: dict = field(default_factory=dict)
 
     calculate_log_probs: bool = False
+
+    # Sampler top-k log-probs per generated token and support-recording budget for score centering; 0 disables.
+    topk_log_probs: int = 0
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
@@ -187,11 +279,12 @@ class RolloutConfig(BaseConfig):
     # Extension point for custom configurations
     custom: Optional[dict] = None
 
-    update_weights_bucket_megabytes: int = 512
+    # Fully qualified class name for a custom CheckpointEngineManager. When set, the trainer
+    # loads this class instead of the built-in CheckpointEngineManager.
+    checkpoint_manager_class: Optional[str] = None
 
-    skip_rollout: bool = False
-
-    skip_dump_dir: str = "/tmp/rollout_dump"
+    # Checkpoint Engine config for update weights from trainer to rollout
+    checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 
     profiler: Optional[ProfilerConfig] = None
 
@@ -209,15 +302,20 @@ class RolloutConfig(BaseConfig):
 
     limit_images: Optional[int] = None
 
-    skip_tokenizer_init: bool = False
+    skip_tokenizer_init: bool = True
 
-    quantization: Optional[str] = None
-
-    quantization_config_file: Optional[str] = None
+    quantization: RolloutQuantizationConfig = field(default_factory=RolloutQuantizationConfig)
 
     enable_rollout_routing_replay: bool = False
+    moe_load_balance_metrics_interval: int = 0
 
     enable_sleep_mode: bool = True
+
+    mtp: MtpConfig = field(default_factory=MtpConfig)
+
+    disaggregation: DisaggregationConfig = field(default_factory=DisaggregationConfig)
+
+    router_config_path: Optional[str] = None
 
     def __post_init__(self):
         """Validate the rollout config"""
@@ -235,13 +333,73 @@ class RolloutConfig(BaseConfig):
                 stacklevel=2,
             )
 
-        if self.expert_parallel_size > 1:
+        if self.name != "trtllm" and self.expert_parallel_size > 1:
             assert self.expert_parallel_size == (self.tensor_model_parallel_size * self.data_parallel_size), (
                 "expert_parallel_size must be equal to tensor_model_parallel_size * data_parallel_size"
             )
 
+        if self.moe_tensor_parallel_size is not None and self.moe_tensor_parallel_size > 1:
+            assert self.name == "trtllm", "moe_tensor_parallel_size is only supported for trtllm"
+
+        if self.name == "trtllm":
+            # If either expert_parallel_size or moe_tensor_parallel_size is at default 1,
+            # convert to None so TensorRT-LLM treats it as unspecified.
+            # When both unspecified: moe_ep_size=1, moe_tp_size=moe_world_size (no EP, all TP).
+            # When only one set: the other is auto-derived from tensor_model_parallel_size.
+            if self.expert_parallel_size is not None and self.expert_parallel_size == 1:
+                self.expert_parallel_size = None
+            if self.moe_tensor_parallel_size is not None and self.moe_tensor_parallel_size == 1:
+                self.moe_tensor_parallel_size = None
+            if self.expert_parallel_size is not None and self.moe_tensor_parallel_size is not None:
+                assert self.moe_tensor_parallel_size * self.expert_parallel_size == self.tensor_model_parallel_size, (
+                    "moe_tensor_parallel_size * expert_parallel_size must equal tensor_model_parallel_size "
+                    f"(got {self.moe_tensor_parallel_size} * {self.expert_parallel_size} = "
+                    f"{self.moe_tensor_parallel_size * self.expert_parallel_size}, "
+                    f"tensor_model_parallel_size={self.tensor_model_parallel_size})"
+                )
+
         if self.pipeline_model_parallel_size > 1:
-            if self.name == "vllm" or self.name == "sglang":
+            if self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
+
+        # Hydra passes this as dict/DictConfig; coerce to dataclass so
+        # downstream .enabled etc. work. BaseConfig is frozen, hence object.__setattr__.
+        if isinstance(self.disaggregation, dict):
+            object.__setattr__(self, "disaggregation", DisaggregationConfig(**self.disaggregation))
+        elif not isinstance(self.disaggregation, DisaggregationConfig):
+            if not isinstance(self.disaggregation, DictConfig):
+                raise TypeError(
+                    f"rollout.disaggregation must be dict, DictConfig, or DisaggregationConfig; "
+                    f"got {type(self.disaggregation).__name__}."
+                )
+            object.__setattr__(
+                self,
+                "disaggregation",
+                DisaggregationConfig(**OmegaConf.to_container(self.disaggregation, resolve=True)),
+            )
+
+        if self.disaggregation.enabled and self.name not in ("sglang", "vllm"):
+            raise ValueError(
+                f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
+            )
+
+        if self.topk_log_probs:
+            if self.name != "vllm":
+                raise ValueError("rollout.topk_log_probs is supported by the vLLM rollout only.")
+            if not self.calculate_log_probs or self.logprobs_mode != "processed_logprobs":
+                raise ValueError(
+                    "rollout.topk_log_probs needs calculate_log_probs=True, logprobs_mode='processed_logprobs' and "
+                    "the vLLM rollout so the returned head uses the sampling distribution."
+                )
+            if 0 < self.topk_log_probs < self.top_k:
+                warnings.warn(
+                    f"rollout.topk_log_probs={self.topk_log_probs} is smaller than the sampling top_k={self.top_k}. "
+                    "Increasing topk_log_probs can allow score centering to align the full sampling support. "
+                    "Actual coverage determines whether the trainer-tail approximation is used.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            vllm_kwargs = self.engine_kwargs.setdefault("vllm", {})
+            vllm_kwargs["max_logprobs"] = max(vllm_kwargs.get("max_logprobs", 0), self.topk_log_probs)

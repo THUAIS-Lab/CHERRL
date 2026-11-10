@@ -1,5 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,171 +11,201 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""SGLang MXFP8 staging and in-place post-load refit utilities.
 
-import logging
-import os
+SGLang derives backend-specific scale layouts during model loading. Bucketed
+weight sync restores canonical scales, loads every bucket, then calls these
+helpers once to rebuild those layouts and copy them back into the storage
+captured by CUDA Graphs.
+"""
+
+from __future__ import annotations
 
 import torch
 
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+MXFP8_BLOCK_SIZE = 32
 
 
-def should_quantize_param(param_name: str) -> bool:
-    """Determine whether to quantize to FP8 based on parameter name
-
-    Quantization rules:
-    - Must end with .weight (exclude bias)
-    - Exclude embedding layers
-    - Exclude normalization layers
-    - Exclude output layer (lm_head)
-    """
-    # Must be a weight parameter
-    if not param_name.endswith(".weight"):
-        return False
-
-    # Layer types to exclude
-    exclude_patterns = [
-        "embed_tokens",  # Embedding layer
-        "lm_head",  # Output layer
-        "layernorm",  # LayerNorm
-        "norm",  # Various Norm layers
-        "ln_",  # LayerNorm variants
-        "embeddings",  # Embeddings
-    ]
-
-    # Check if matches exclude patterns
-    param_lower = param_name.lower()
-    for pattern in exclude_patterns:
-        if pattern in param_lower:
-            return False
-
-    # Layer types to include (Linear layers)
-    include_patterns = [
-        "q_proj",  # Query projection
-        "k_proj",  # Key projection
-        "v_proj",  # Value projection
-        "o_proj",  # Output projection
-        "gate_proj",  # Gate projection (for MLP)
-        "up_proj",  # Up projection (for MLP)
-        "down_proj",  # Down projection (for MLP)
-        "fc1",  # Fully connected 1
-        "fc2",  # Fully connected 2
-        "gate",  # Gate (for MoE)
-        "mlp",  # MLP layers
-    ]
-
-    # Check if matches include patterns
-    for pattern in include_patterns:
-        if pattern in param_lower:
-            logger.debug(f"Will quantize FP8: {param_name}")
-            return True
-
-    # Do not quantize by default
-    logger.debug(f"Skip quantization: {param_name}")
-    return False
-
-
-def scaled_fp8_blockwise(
-    data_hp,
-    weight_block_size,
-):
-    # cast tensor from high precision to FP8 with 128*128 blockwise quantization.
-    assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
-
-    block_size1 = weight_block_size[1]
-    block_size0 = weight_block_size[0]
-    assert data_hp.shape[1] % block_size1 == 0, (
-        f"data_hp.shape[1] {data_hp.shape[1]}  must be a multiple of block_size1: {block_size1}."
-    )
-    assert data_hp.shape[0] % block_size0 == 0, (
-        f"data_hp.shape[0] {data_hp.shape[0]} must be a multiple of block_size0: {block_size0}."
+def _is_mxfp8_linear(module: torch.nn.Module) -> bool:
+    qm = getattr(module, "quant_method", None)
+    return (
+        qm is not None
+        and getattr(qm, "use_mxfp8", False)
+        and hasattr(qm, "process_weights_after_loading")
+        and hasattr(module, "weight_scale_inv")
     )
 
-    # FP8
-    max_dtype = torch.finfo(torch.float8_e4m3fn).max
 
-    original_shape = data_hp.shape
-    blk_m, blk_n = data_hp.shape[0] // block_size0, data_hp.shape[1] // block_size1
+def _layer_backend(qm) -> tuple[object, bool]:
+    """Return ``(backend, resolved)`` for one MXFP8 quant method.
 
-    assert block_size1 == block_size0
-    data_hp = data_hp.reshape(blk_m, block_size0, blk_n, block_size1)
-
-    # Permute to (BLK_M, BLK_N, BLOCK_SIZE_M, BLOCK_SIZE_N)
-    data_hp = data_hp.permute(0, 2, 1, 3)
-    # Flatten to (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N)
-    data_hp = data_hp.to(torch.float32).contiguous().flatten(start_dim=2)
-
-    # Calculate max absolute value per block
-    max_abs = torch.amax(torch.abs(data_hp), dim=-1, keepdim=True)
-
-    # Use FP32 scale
-    scale_fp = max_dtype / max_abs
-    scale_fp = torch.where(max_abs == 0, 1.0, scale_fp)
-    # preserve the behavior for 0 amax case
-    scale_fp = torch.where(max_abs == torch.inf, 1.0, scale_fp)
-
-    descale_fp = torch.reciprocal(scale_fp)
-
-    # Scale and saturate cast the data elements to max of target dtype
-    data_lp = torch.clamp(data_hp * scale_fp, min=-1 * max_dtype, max=max_dtype)
-
-    fp_data = data_lp.to(torch.float8_e4m3fn)
-
-    # (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N) to (M, N)
-    fp_data = fp_data.reshape(blk_m, blk_n, block_size0, block_size1).permute(0, 2, 1, 3).reshape(original_shape)
-
-    # Convert to target format, but still in original precision container
-    return fp_data, descale_fp
-
-
-def quant_weights_by_name(weights, quant_config, dtype=torch.bfloat16):
-    """FP8 quantization based on parameter name
-
-    Args:
-        weights: Generator of (name, tensor) pairs
-        quant_config: Quantization configuration
-        dtype: Data type for intermediate computation
-
-    Returns:
-        List of (name, tensor) pairs with quantized weights
+    ``resolved`` is True when sglang itself resolved the MXFP8 dense backend
+    (>= 0.5.18, ``quant_method.mxfp8_dense_backend``); otherwise the requested
+    ``--fp8-gemm-backend`` is returned, where ``auto`` means Triton for MXFP8.
     """
+    backend = getattr(qm, "mxfp8_dense_backend", None)
+    if backend is not None:
+        return backend, True
+    from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
 
-    weights_quantized = []
+    return get_fp8_gemm_runner_backend(), False
 
-    if isinstance(quant_config, dict):
-        weight_block_size = quant_config.get("weight_block_size")
-    else:
-        weight_block_size = getattr(quant_config, "weight_block_size", None)
 
-    if weight_block_size is None:
-        raise ValueError("weight_block_size not found in quant_config")
+def _needs_reprocess(backend, resolved: bool) -> bool:
+    if backend.is_flashinfer_trtllm():
+        raise NotImplementedError(
+            "MXFP8 weight sync with the flashinfer_trtllm GEMM backend is not supported: that backend "
+            "shuffles the weight tensor in place at load time, so post-load processing cannot be re-run "
+            "after a sync. Use flashinfer_cutlass / flashinfer_cutedsl, or leave the backend unset."
+        )
+    if resolved:
+        # CUTLASS, CuTe-DSL and DeepGEMM all derive their kernel layout from the canonical
+        # weight_scale_inv the sync just rewrote; re-running the processing is idempotent for
+        # them and a no-op for backends that read the canonical scale directly.
+        return True
+    # sglang <= 0.5.17: only flashinfer_cutlass keeps a derived copy; Triton (auto) reads
+    # weight_scale_inv directly.
+    return backend.is_flashinfer_cutlass()
 
-    for k, v in weights:
-        # Check if quantization is needed
-        if not should_quantize_param(k):
-            weights_quantized.append((k, v))
+
+def reprocess_mxfp8_layers(model: torch.nn.Module) -> int:
+    """Re-derive backend-specific MXFP8 scale layouts from the canonical scales.
+
+    Returns the number of modules reprocessed. Raises for backends whose
+    post-load processing is not idempotent (``flashinfer_trtllm``).
+    """
+    count = 0
+    for name, module in model.named_modules():
+        if not _is_mxfp8_linear(module):
             continue
-
-        # Quantize to FP8
-        try:
-            if weight_block_size is not None:
-                if torch.distributed.get_rank() == 0:
-                    logger.debug(f"  Quantizing to FP8 blockwise: {k}")
-                param_lp, param_scale = scaled_fp8_blockwise(
-                    v.to(dtype),
-                    weight_block_size=weight_block_size,
+        qm = module.quant_method
+        backend, resolved = _layer_backend(qm)
+        if not _needs_reprocess(backend, resolved):
+            continue
+        if not getattr(qm, "is_checkpoint_fp8_serialized", True):
+            # Would re-quantize from a bf16 master weight that a sync just replaced with fp8 data.
+            raise RuntimeError(
+                f"{name}: MXFP8 quant method expects a non-fp8-serialized checkpoint; refusing to "
+                "re-quantize after a weight sync."
+            )
+        # DeepGEMM can fall back to FlashInfer for unsupported shapes. SGLang clears
+        # the fallback's swizzled scale before rebuilding it, which would otherwise
+        # rebind storage that CUDA graphs captured at startup.
+        captured = {
+            attr: value
+            for attr in ("weight_scale_inv_swizzled", "weight_scale_inv_deepgemm")
+            if isinstance((value := getattr(module, attr, None)), torch.Tensor)
+        }
+        qm.process_weights_after_loading(module)
+        for attr, live in captured.items():
+            rebuilt = getattr(module, attr, None)
+            if not isinstance(rebuilt, torch.Tensor):
+                raise RuntimeError(f"{name}.{attr}: post-load processing did not rebuild the captured scale")
+            if rebuilt.shape != live.shape or rebuilt.dtype != live.dtype:
+                raise RuntimeError(
+                    f"{name}.{attr}: post-load processing produced {tuple(rebuilt.shape)}/{rebuilt.dtype} but "
+                    f"CUDA graphs captured {tuple(live.shape)}/{live.dtype}"
                 )
-                param_scale = param_scale.squeeze(-1)
-                weights_quantized.append([k, param_lp])
-                weights_quantized.append([k + "_scale_inv", param_scale])
-            else:
-                raise ValueError(
-                    "Only blockwise quantization is supported. Please set weight_block_size in quant_config"
-                )
-        except Exception as e:
-            logger.error(f"Failed to quantize {k}: {e}")
-            # If quantization fails, use original weights
-            weights_quantized.append((k, v))
+            if rebuilt.data_ptr() != live.data_ptr():
+                live.copy_(rebuilt)
+                setattr(module, attr, live)
+        count += 1
+    return count
 
-    return weights_quantized
+
+# ---------------------------------------------------------------------------
+# MoE experts
+# ---------------------------------------------------------------------------
+
+_MOE_SCALE_PAIRS = (("w13_weight", "w13_weight_scale_inv"), ("w2_weight", "w2_weight_scale_inv"))
+
+
+def _is_mxfp8_moe(module: torch.nn.Module) -> bool:
+    qm = getattr(module, "quant_method", None)
+    return (
+        qm is not None
+        and getattr(qm, "use_mxfp8", False)
+        and hasattr(qm, "process_weights_after_loading")
+        and hasattr(module, "w13_weight_scale_inv")
+    )
+
+
+def _canonical_scale_shape(weight: torch.Tensor) -> tuple[int, ...]:
+    return (*tuple(weight.shape[:-1]), weight.shape[-1] // MXFP8_BLOCK_SIZE)
+
+
+def stage_mxfp8_moe_scales(model: torch.nn.Module) -> list[tuple[torch.nn.Module, str, torch.Tensor]]:
+    """Expose canonical-layout expert scale buffers so ``load_weights`` can write into them.
+
+    Returns ``(module, scale_name, live_data)`` for every expert scale whose live
+    buffer no longer has the checkpoint shape or dtype; ``reprocess_mxfp8_moe_layers``
+    folds the re-derived layout back into ``live_data``. Scales the runner rewrote
+    without changing shape or dtype (FlashInfer TRT-LLM; CUTLASS on sglang <= 0.5.15)
+    or left canonical (CUTLASS on sglang >= 0.5.20) are not staged: ``load_weights``
+    writes the canonical data over the live buffer and the re-processing rewrites it
+    in place, if at all.
+    """
+    pending = []
+    for module in model.modules():
+        if not _is_mxfp8_moe(module):
+            continue
+        for wname, sname in _MOE_SCALE_PAIRS:
+            weight = getattr(module, wname, None)
+            param = getattr(module, sname, None)
+            if weight is None or not isinstance(param, torch.nn.Parameter):
+                continue
+            canonical = _canonical_scale_shape(weight.data)
+            if tuple(param.data.shape) == canonical and param.data.dtype == torch.uint8:
+                continue
+            staging = torch.empty(canonical, dtype=torch.uint8, device=param.data.device)
+            pending.append((module, sname, param, staging))
+    # Rebind only once every staging buffer is allocated: a failed allocation must not leave a
+    # parameter on a staging buffer that no returned list records.
+    staged = []
+    for module, sname, param, staging in pending:
+        staged.append((module, sname, param.data))
+        param.data = staging
+    return staged
+
+
+def reprocess_mxfp8_moe_layers(model: torch.nn.Module, staged: list[tuple[torch.nn.Module, str, torch.Tensor]]) -> int:
+    """Re-run the MoE post-load processing and fold results into the captured storage."""
+    live_by_key = {(id(m), n): live for m, n, live in staged}
+    count = 0
+    for name, module in model.named_modules():
+        if not _is_mxfp8_moe(module):
+            continue
+        qm = module.quant_method
+        if not getattr(qm, "is_checkpoint_fp8_serialized", True):
+            raise RuntimeError(
+                f"{name}: MXFP8 MoE quant method expects a non-fp8-serialized checkpoint; refusing to "
+                "re-quantize experts after a weight sync."
+            )
+        qm.process_weights_after_loading(module)
+        for _, sname in _MOE_SCALE_PAIRS:
+            live = live_by_key.get((id(module), sname))
+            if live is None:
+                continue
+            param = getattr(module, sname)
+            new = param.data
+            if tuple(new.shape) != tuple(live.shape) or new.dtype != live.dtype:
+                raise RuntimeError(
+                    f"{name}.{sname}: post-load processing produced {tuple(new.shape)}/{new.dtype} but the live "
+                    f"buffer is {tuple(live.shape)}/{live.dtype}; the MoE runner's scale layout changed between "
+                    "load and refit and cannot be updated in place."
+                )
+            if new.data_ptr() != live.data_ptr():
+                live.copy_(new)
+            param.data = live
+        count += 1
+    # Post-condition: every staged scale is back on the storage the CUDA graph captured. A module
+    # that was staged but not visited above (predicate changed between stage and reprocess) would
+    # otherwise keep serving the staging buffer while the graph replays the stale live one.
+    for module, sname, live in staged:
+        param = getattr(module, sname)
+        if param.data.data_ptr() != live.data_ptr():
+            raise RuntimeError(
+                f"{type(module).__name__}.{sname}: staged for the sync but not folded back into its live "
+                "storage by reprocess_mxfp8_moe_layers; the CUDA graph would keep reading stale scales."
+            )
+    return count

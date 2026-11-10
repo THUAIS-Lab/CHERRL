@@ -100,7 +100,8 @@ def get_npu_profiler(
     Args:
         contents (list[str]):
             A list of options to control the collection content,
-            such as npu, cpu, memory, shapes, module, stack.
+            such as npu, memory, shapes, module, stack. CPU activity is always collected,
+            since the per-stage mstx markers are CPU-side events.
         profile_level (str):
             The collection level, which can be set to level_none,
             level0, level1 and level2.
@@ -141,11 +142,12 @@ def get_npu_profiler(
         mstx_domain_exclude=["communication"],
     )
 
-    activites = []
+    # CPU activity is always collected, whatever `contents` selects: verl marks each stage with an
+    # mstx range, and those markers -- like operator names -- are CPU-side events, so a device-only
+    # trace would be bare kernels that cannot be attributed to any stage.
+    activites = [torch_npu.profiler.ProfilerActivity.CPU]
     if contents is None or "npu" in contents:
         activites.append(torch_npu.profiler.ProfilerActivity.NPU)
-    if contents is None or "cpu" in contents:
-        activites.append(torch_npu.profiler.ProfilerActivity.CPU)
 
     prof = torch_npu.profiler.profile(
         with_modules=contents is None or "module" in contents,
@@ -178,46 +180,44 @@ class NPUProfiler(DistProfiler):
             config = ProfilerConfig(ranks=[], enable=False)
         if not tool_config:
             assert not config.enable, "tool_config must be set when profiler is enabled"
-        self.enable: bool = config.enable
-        if not config.enable:
-            return
-        self.this_step: bool = False
         self.discrete: bool = tool_config.discrete
-        self.this_rank: bool = False
         self.profile_npu = None
         self.profile_contents = tool_config.contents
         self.profile_level = tool_config.level
         self.profile_save_path = config.save_path
         self.analysis = tool_config.analysis
-        if config.all_ranks:
-            self.this_rank = True
-        elif config.ranks:
-            self.this_rank = rank in config.ranks
 
     def start(self, **kwargs):
-        role, profile_step = kwargs.get("role", None), kwargs.get("profile_step", None)
-        profile_step = str(profile_step) if profile_step is not None else None
-        if self.enable and self.this_rank:
-            self.this_step = True
-            if not self.discrete and NPUProfiler._define_count == 0:
-                self.profile_npu = get_npu_profiler(
-                    contents=self.profile_contents,
-                    profile_level=self.profile_level,
-                    profile_save_path=self.profile_save_path,
-                    analysis=self.analysis,
-                    role=role,
-                    profile_step=profile_step,
-                )
-                self.profile_npu.start()
-                NPUProfiler._define_count += 1
+        role = kwargs.get("role", None)
+        if not self.discrete and NPUProfiler._define_count == 0:
+            self.profile_npu = get_npu_profiler(
+                contents=self.profile_contents,
+                profile_level=self.profile_level,
+                profile_save_path=self.profile_save_path,
+                analysis=self.analysis,
+                role=role,
+            )
+            self.profile_npu.start()
+            NPUProfiler._define_count += 1
 
     def stop(self):
-        if self.enable and self.this_rank:
-            self.this_step = False
-            if not self.discrete and NPUProfiler._define_count == 1:
-                self.profile_npu.step()
-                self.profile_npu.stop()
-                NPUProfiler._define_count -= 1
+        if not self.discrete and NPUProfiler._define_count == 1:
+            self.profile_npu.step()
+            self.profile_npu.stop()
+            NPUProfiler._define_count -= 1
+
+    def step(self):
+        """No-op per-mini-batch hook.
+
+        The actor update loop calls this once per mini-batch to drive the torch profiler's
+        schedule, but the NPU profiler is driven by explicit start/stop calls, so it has nothing
+        to advance here. It must still be defined: without it, the dispatcher's
+        ``getattr(self._impl, "step", lambda: None)`` resolves to the inherited
+        ``DistProfiler.step`` (backend impls subclass ``DistProfiler`` but never run its
+        ``__init__``), which then reads dispatcher-only state such as ``_enable`` and raises
+        ``AttributeError``.
+        """
+        return
 
     def annotate(self, message: Optional[str] = None, role: Optional[str] = None, **kwargs_outer) -> Callable:
         """Decorate a Worker member function to profile the current rank in the current training step.
@@ -235,39 +235,33 @@ class NPUProfiler(DistProfiler):
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs_inner):
-                if not self.enable:
-                    return func(*args, **kwargs_inner)
-
-                profile_name = message or func.__name__
+                # Prefer the stage label (`role`, e.g. "actor_compute_log_prob"): it names both the
+                # role and the function, which the method name alone cannot do for a colocated
+                # worker. Fall back to the method name for stages that declare no role.
+                profile_name = message or role or func.__name__
                 discrete_mode = self.discrete
-                profile_enable = self.this_step and self.enable
 
-                if not profile_enable:
-                    return func(*args, **kwargs_inner)
-
-                if profile_enable:
-                    if not discrete_mode:
-                        mark_range = mark_start_range(message=profile_name)
-                    else:
-                        profile_npu = get_npu_profiler(
-                            contents=self.profile_contents,
-                            profile_level=self.profile_level,
-                            profile_save_path=self.profile_save_path,
-                            analysis=self.analysis,
-                            role=role,
-                        )
-                        profile_npu.start()
-                        mark_range = mark_start_range(message=profile_name)
+                if not discrete_mode:
+                    mark_range = mark_start_range(message=profile_name)
+                else:
+                    profile_npu = get_npu_profiler(
+                        contents=self.profile_contents,
+                        profile_level=self.profile_level,
+                        profile_save_path=self.profile_save_path,
+                        analysis=self.analysis,
+                        role=role,
+                    )
+                    profile_npu.start()
+                    mark_range = mark_start_range(message=profile_name)
 
                 result = func(*args, **kwargs_inner)
 
-                if profile_enable:
-                    if not discrete_mode:
-                        mark_end_range(mark_range)
-                    else:
-                        mark_end_range(mark_range)
-                        profile_npu.step()
-                        profile_npu.stop()
+                if not discrete_mode:
+                    mark_end_range(mark_range)
+                else:
+                    mark_end_range(mark_range)
+                    profile_npu.step()
+                    profile_npu.stop()
 
                 return result
 

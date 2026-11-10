@@ -16,6 +16,7 @@ import logging
 import os
 import socket
 from copy import deepcopy
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
@@ -24,9 +25,11 @@ from ray.experimental.state.api import get_actor
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
+from verl.plugin.platform import get_platform
 from verl.protocol import DataProto, _padding_size_key
 from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
+from verl.utils.device import get_device_name
 from verl.utils.py_functional import temp_env_var
 
 __all__ = ["Worker"]
@@ -85,11 +88,25 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
 
 
 @ray.remote
-def get_master_addr_port() -> tuple[str, str]:
+def get_master_addr_port(master_port_range: Optional[list[int]] = None) -> tuple[str, str]:
     addr = ray.util.get_node_ip_address().strip("[]")
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        port = sock.getsockname()[1]
+
+    if master_port_range is None:
+        with socket.socket() as s:
+            s.bind(("", 0))
+            port = s.getsockname()[1]
+    else:
+        port = master_port_range[0]
+        while port < master_port_range[1]:
+            try:
+                with socket.socket() as s:
+                    s.bind(("", port))
+                    break
+            except OSError:
+                port += 1  # Increment port number if already in use
+                logger.info("Port %d is already in use, trying port %d", port - 1, port)
+        else:
+            raise RuntimeError(f"Could not find a free port in range {master_port_range}")
     return addr, str(port)
 
 
@@ -103,6 +120,10 @@ class RayResourcePool(ResourcePool):
         detached=False,
         accelerator_type: Optional[str] = None,
     ) -> None:
+        # TPU claims a chip exclusively per process, so colocating more than one
+        # WorkerGroup builds a placement group that can never be satisfied.
+        if not get_platform().supports_colocated_worker_groups():
+            max_colocate_count = 1
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
         # print(f"in RayProcessDispatchConfiguration: name_prefix = {name_prefix}")
@@ -119,14 +140,20 @@ class RayResourcePool(ResourcePool):
             name if name else f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
         )
         # print(f"pg_name_prefix = {pg_name_prefix}")
-        if device_name == "npu":
-            device_name = "NPU"
-        elif device_name == "cuda":
-            device_name = "GPU"
+        current_platform = get_platform()
+        if device_name != current_platform.device_name:
+            logger.warning(
+                f"Requested device {device_name} does not match current platform device {current_platform.device_name}"
+            )
+        device_name = current_platform.ray_resource_name()
 
         bundle = {"CPU": self.max_colocate_count}
         if self.use_gpu:
             bundle[device_name] = 1
+            if self.accelerator_type is None and current_platform.device_name == "tpu":
+                # Ray places each per-node placement group independently, so a multi-host pool can
+                # straddle two TPU slices, which the TPU mesh cannot span. Pin the pool to one slice.
+                self.accelerator_type = current_platform.auto_assign_accelerator_type(self.name_prefix, None)
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
@@ -160,6 +187,71 @@ class SubRayResourcePool(RayResourcePool):
     @property
     def world_size(self):
         return self.subgroup_world_size
+
+
+@dataclass
+class ResourcePoolManager:
+    """
+    Define a resource pool specification. Resource pool will be initialized first.
+    """
+
+    resource_pool_spec: dict[str, list[int]]
+    mapping: dict[int, str]
+    max_colocate_count: int = 3
+    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Mirror the cap in RayResourcePool so the bundle CPU count matches what it creates.
+        if not get_platform().supports_colocated_worker_groups():
+            self.max_colocate_count = 1
+
+    def create_resource_pool(self):
+        """Create Ray resource pools for distributed training.
+
+        Initializes resource pools based on the resource pool specification,
+        with each pool managing GPU resources across multiple nodes.
+        For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
+        For Megatron backend, uses max_colocate_count>1 for different models.
+        """
+        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
+            # For FSDP backend, using max_colocate_count=3: actor_critic_ref, rollout, reward model (optional)
+            # For Megatron backend, we recommend using max_colocate_count>1
+            # that can utilize different WorkerGroup for differnt models
+            resource_pool = RayResourcePool(
+                process_on_nodes=process_on_nodes,
+                use_gpu=True,
+                max_colocate_count=self.max_colocate_count,
+                name_prefix=resource_pool_name,
+            )
+            self.resource_pool_dict[resource_pool_name] = resource_pool
+
+        self._check_resource_available()
+
+    def get_resource_pool(self, role) -> RayResourcePool:
+        """Get the resource pool of the worker_cls"""
+        return self.resource_pool_dict[self.mapping[role]]
+
+    def get_n_gpus(self) -> int:
+        """Get the number of gpus in this cluster."""
+        return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
+
+    def _check_resource_available(self):
+        """Check if the resource pool can be satisfied in this ray cluster."""
+        # accelerator resource key differs per platform ("GPU", "NPU", ...)
+        resource_name = get_platform().ray_resource_name()
+        node_available_resources = ray._private.state.available_resources_per_node()
+
+        # check total required devices can be satisfied
+        total_available = sum(node_info.get(resource_name, 0) for node_info in node_available_resources.values())
+        total_required = sum(
+            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
+        )
+        if total_available < total_required:
+            raise ValueError(
+                f"Total available {resource_name} {total_available} is less than "
+                f"total desired {resource_name} {total_required}"
+            )
 
 
 def extract_pg_from_exist(
@@ -221,7 +313,8 @@ def split_resource_pool(
         start_bundle_idx_list = np.cumsum([0] + split_size_list[:-1])
 
     # ensure resource_pool.pgs has been initialized
-    placement_groups = resource_pool.get_placement_groups()
+    device = get_device_name()
+    placement_groups = resource_pool.get_placement_groups(device_name=device)
     split_resource_pools = [
         SubRayResourcePool(
             process_on_nodes=resource_pool.store,
@@ -245,8 +338,12 @@ def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResour
 
     new_store = rp1.store + rp2.store
 
-    merged = type(rp1)(new_store, rp1.use_gpu, f"{rp1.name_prefix}_{rp2.name_prefix}")
-    merged.pgs = rp1.get_placement_groups() + rp2.get_placement_groups()
+    merged = type(rp1)(
+        new_store, rp1.use_gpu, f"{rp1.name_prefix}_{rp2.name_prefix}", rp1.max_colocate_count, rp1.detached
+    )
+    merged.pgs = rp1.get_placement_groups(device_name=get_device_name()) + rp2.get_placement_groups(
+        device_name=get_device_name()
+    )
 
     return merged
 
@@ -316,10 +413,9 @@ class RayClassWithInitArgs(ClassWithInitArgs):
         }
         options.update(self._options)
 
-        if use_gpu and device_name == "cuda":
-            options["num_gpus"] = num_gpus
-        if use_gpu and device_name == "npu":
-            options["resources"] = {"NPU": num_gpus}
+        if use_gpu:
+            resource_opts = get_platform().ray_resource_options(num_gpus)
+            options.update(resource_opts)
 
         if len(self._additional_resource) > 1:
             for k, v in self._additional_resource.items():
@@ -365,12 +461,14 @@ class RayWorkerGroup(WorkerGroup):
         """
         self._master_addr = kwargs.pop("master_addr", None)
         self._master_port = kwargs.pop("master_port", None)
+        self.use_gpu = kwargs.pop("use_gpu", resource_pool.use_gpu if resource_pool is not None else True)
+        self._ray_master_port_range = kwargs.pop("master_port_range", None)
         super().__init__(resource_pool=resource_pool, **kwargs)
         self.ray_cls_with_init = ray_cls_with_init
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
         self._ray_wait_register_center_timeout = ray_wait_register_center_timeout
         # Whether the WorkerGroup is a Colocate WorkerGroup created by FusedWorker.
-        self.fused_worker_used = ray_cls_with_init.fused_worker_used
+        self.fused_worker_used = False if ray_cls_with_init is None else ray_cls_with_init.fused_worker_used
         # if a WorkerGroup is spawned from Colocate WorkerGroup, this indicates which sub-class is binded to
         # this WorkerGroup.
         self.sub_cls_name = ""
@@ -429,17 +527,17 @@ class RayWorkerGroup(WorkerGroup):
         # https://github.com/ray-project/ray/pull/45699
         workers = worker_handles if worker_handles else [ray.get_actor(name=name) for name in worker_names]
         self._workers = workers
-        self._world_size = len(worker_names)
+        self._world_size = len(workers)
 
-    def _get_master_addr_port(self, pg):
+    def _get_master_addr_port(self, pg, bundle_index=0, master_port_range=None):
         """Get master addr and port for this worker group"""
         if self._master_addr is None and self._master_port is None:
             self._master_addr, self._master_port = ray.get(
                 get_master_addr_port.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg, placement_group_bundle_index=0
+                        placement_group=pg, placement_group_bundle_index=bundle_index
                     ),
-                ).remote()
+                ).remote(master_port_range=master_port_range)
             )
         elif self._master_addr is not None and self._master_port is not None:
             logger.debug(f"{self._master_addr=} {self._master_port=}")
@@ -449,7 +547,14 @@ class RayWorkerGroup(WorkerGroup):
                 "or neither should be provided to use Ray's default assignment."
             )
 
-    def _init_with_resource_pool(self, resource_pool, ray_cls_with_init, bin_pack, detached, worker_env=None):
+    def _init_with_resource_pool(
+        self,
+        resource_pool,
+        ray_cls_with_init,
+        bin_pack,
+        detached,
+        worker_env=None,
+    ):
         """Initialize the worker group by creating new workers from a resource pool.
 
         Args:
@@ -459,7 +564,6 @@ class RayWorkerGroup(WorkerGroup):
             detached: Whether workers should be detached
         """
         self.resource_pool = resource_pool
-
         strategy = "PACK"
         if bin_pack:
             strategy = "STRICT_PACK"
@@ -473,7 +577,7 @@ class RayWorkerGroup(WorkerGroup):
         for pg_idx, pg in enumerate(sort_placement_group_by_node_ip(pgs)):
             assert local_world_size <= pg.bundle_count, f"when generating for {self.name_prefix}, for the "
             if pg_idx == 0:
-                self._get_master_addr_port(pg)
+                self._get_master_addr_port(pg, bundle_index=0, master_port_range=self._ray_master_port_range)
 
             for local_rank in range(local_world_size):
                 rank += 1
@@ -505,7 +609,11 @@ class RayWorkerGroup(WorkerGroup):
 
         rank = -1
         local_world_size = resource_pool.store[0]
-        self._get_master_addr_port(pgs[0])
+        self._get_master_addr_port(
+            pgs[resource_pool.start_bundle_index // local_world_size],
+            bundle_index=resource_pool.start_bundle_index % local_world_size,
+            master_port_range=self._ray_master_port_range,
+        )
         for curr_rank in range(resource_pool.start_bundle_index, resource_pool.start_bundle_index + world_size):
             pg_idx = curr_rank // local_world_size
             pg = pgs[pg_idx]
@@ -527,6 +635,8 @@ class RayWorkerGroup(WorkerGroup):
     def _create_worker(self, rank, pg_idx, pg, local_rank, resource_pool, ray_cls_with_init, worker_env, detached):
         world_size = resource_pool.world_size
         use_gpu = resource_pool.use_gpu
+        if self.use_gpu and not use_gpu:
+            raise ValueError("use_gpu is True but resource_pool.use_gpu is False")
         local_world_size = resource_pool.store[0]
         num_gpus = 1 / resource_pool.max_colocate_count
 
@@ -540,6 +650,22 @@ class RayWorkerGroup(WorkerGroup):
             "MASTER_ADDR": self._master_addr,
             "MASTER_PORT": self._master_port,
         }
+        # TPU workers need slice and mesh environment derived from the placement groups, which
+        # Ray does not supply. Kept as an explicit TPU branch rather than a PlatformBase hook,
+        # since no other platform needs it.
+        platform = get_platform()
+        if platform.device_name == "tpu":
+            env_vars.update(
+                platform.get_worker_env_vars(
+                    resource_pool=resource_pool,
+                    rank=rank,
+                    world_size=world_size,
+                    local_rank=local_rank,
+                    local_world_size=local_world_size,
+                    name_prefix=self.name_prefix,
+                    device_name=self.device_name,
+                )
+            )
         if worker_env is not None:
             logging.debug(f"Appending ray class env, origin: {env_vars}, customized env: {worker_env}")
             conflict_env_vars = set(env_vars.keys()) & set(worker_env.keys())
@@ -558,17 +684,13 @@ class RayWorkerGroup(WorkerGroup):
         name = f"{self.name_prefix}{cia_name}_{pg_idx}:{local_rank}"  # e.g. Worker_2:5
 
         if self.profile_steps and self.device_name == "cuda":
-            ray_cls_with_init.update_options(
-                {
-                    "runtime_env": {
-                        "env_vars": env_vars,
-                        "nsight": self.worker_nsight_options,
-                    },
-                    "name": name,
-                }
-            )
+            runtime_env = {
+                "env_vars": env_vars,
+                "nsight": self.worker_nsight_options,
+            }
         else:
-            ray_cls_with_init.update_options({"runtime_env": {"env_vars": env_vars}, "name": name})
+            runtime_env = {"env_vars": env_vars}
+        ray_cls_with_init.update_options({"runtime_env": runtime_env, "name": name})
 
         if detached:
             ray_cls_with_init.update_options({"lifetime": "detached"})
@@ -577,7 +699,7 @@ class RayWorkerGroup(WorkerGroup):
         worker = ray_cls_with_init(
             placement_group=pg,
             placement_group_bundle_idx=local_rank,
-            use_gpu=use_gpu,
+            use_gpu=self.use_gpu,
             num_gpus=num_gpus,
             device_name=self.device_name,
         )

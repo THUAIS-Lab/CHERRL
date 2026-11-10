@@ -23,9 +23,9 @@ from dataclasses import dataclass
 import ray
 
 from verl.utils.device import (
+    get_resource_name,
     get_torch_device,
     get_visible_devices_keyword,
-    is_npu_available,
 )
 
 from .decorator import Dispatch, Execute, register
@@ -165,15 +165,6 @@ class Worker(WorkerHelper):
         for is_collect in collect_dp_rank.values():
             self.__collect_dp_rank[mesh_name] = is_collect
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=True)
-    def create_transferqueue_client(self, config):
-        from verl.utils.transferqueue_utils import create_transferqueue_client
-
-        create_transferqueue_client(
-            client_id=f"worker_{self.rank}",
-            config=config.transfer_queue,
-        )
-
     @classmethod
     def env_keys(cls):
         """The keys of the environment variables that are used to configure the Worker."""
@@ -284,8 +275,7 @@ class Worker(WorkerHelper):
             # environment variable for each actor, unless
             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set,
             # so we need to set local rank when the flag is set.
-            device_name = "NPU" if is_npu_available else "GPU"
-            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            local_rank = ray.get_runtime_context().get_accelerator_ids()[get_resource_name()][0]
             os.environ["LOCAL_RANK"] = local_rank
             get_torch_device().set_device(int(local_rank))
 

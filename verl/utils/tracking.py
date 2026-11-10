@@ -16,12 +16,24 @@ A unified tracking interface that supports logging data to different backend
 """
 
 import dataclasses
+import inspect
 import json
+import logging
 import os
+from contextlib import contextmanager
 from enum import Enum
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
+
+import orjson
+from packaging.version import Version
+
+logger = logging.getLogger(__name__)
+
+MLFLOW_MAX_ATTEMPTS = 3
+MLFLOW_SLEEP_SECONDS = 5
 
 
 class Tracking:
@@ -45,6 +57,7 @@ class Tracking:
         "clearml",
         "trackio",
         "file",
+        "rl_insight",
     ]
 
     def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
@@ -59,6 +72,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._finished = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -74,31 +88,46 @@ class Tracking:
 
         if "trackio" in default_backend:
             import trackio
+            from trackio import context_vars
 
-            trackio.init(project=project_name, name=experiment_name, config=config)
-            self.logger["trackio"] = trackio
+            if context_vars.current_run.get() is None:
+                trackio.init(project=project_name, name=experiment_name, config=config)
+            self.logger["trackio"] = _TrackioLoggingAdapter(trackio)
 
         if "mlflow" in default_backend:
             import os
+            import time
 
             import mlflow
 
-            MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:////tmp/mlruns.db")
-            mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+            for _mlflow_attempt in range(1, MLFLOW_MAX_ATTEMPTS + 1):
+                try:
+                    MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:////tmp/mlruns.db")
+                    logger.info("Using MLFlow tracking URI: %s", MLFLOW_TRACKING_URI)
+                    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
-            # Some cloud providers like Azure ML or Databricks automatically set MLFLOW_RUN_ID
-            # If set, attach to the existing run instead of creating a new one
-            run_id = os.environ.get("MLFLOW_RUN_ID")
-            if run_id:
-                mlflow.start_run(run_id=run_id)
-            else:
-                # Project_name is actually experiment_name in MLFlow
-                # If experiment does not exist, will create a new experiment
-                experiment = mlflow.set_experiment(project_name)
-                mlflow.start_run(experiment_id=experiment.experiment_id, run_name=experiment_name)
+                    # Some cloud providers like Azure ML or Databricks automatically set MLFLOW_RUN_ID
+                    # If set, attach to the existing run instead of creating a new one
+                    run_id = os.environ.get("MLFLOW_RUN_ID")
+                    if run_id:
+                        mlflow.start_run(run_id=run_id)
+                    else:
+                        # Project_name is actually experiment_name in MLFlow
+                        # If experiment does not exist, will create a new experiment
+                        experiment = mlflow.set_experiment(project_name)
+                        mlflow.start_run(experiment_id=experiment.experiment_id, run_name=experiment_name)
 
-            mlflow.log_params(_compute_mlflow_params_from_objects(config))
-            self.logger["mlflow"] = _MlflowLoggingAdapter()
+                    mlflow.log_params(_compute_mlflow_params_from_objects(config))
+                    self.logger["mlflow"] = _MlflowLoggingAdapter()
+                    break  # Success
+                except Exception as e:
+                    logger.warning(
+                        "MLflow initialization attempt %d/%d failed: %s", _mlflow_attempt, MLFLOW_MAX_ATTEMPTS, e
+                    )
+                    if _mlflow_attempt < MLFLOW_MAX_ATTEMPTS:
+                        time.sleep(MLFLOW_SLEEP_SECONDS)
+                    else:
+                        logger.warning("All MLflow initialization attempts failed. Proceeding without MLflow tracking.")
 
         if "swanlab" in default_backend:
             import os
@@ -157,26 +186,312 @@ class Tracking:
         if "file" in default_backend:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
+        if "rl_insight" in default_backend:
+            self.logger["rl_insight"] = RLInsightLogger(project_name, experiment_name, config)
+
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def finish(self, exit_code: int = 0):
+        """Flush and finalize every configured backend exactly once."""
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
+        loggers = getattr(self, "logger", {})
+
+        if "wandb" in loggers:
+            loggers["wandb"].finish(exit_code=exit_code)
+        if "swanlab" in loggers:
+            loggers["swanlab"].finish()
+        if "vemlp_wandb" in loggers:
+            loggers["vemlp_wandb"].finish(exit_code=exit_code)
+        if "tensorboard" in loggers:
+            loggers["tensorboard"].finish()
+        if "clearml" in loggers:
+            loggers["clearml"].finish()
+        if "mlflow" in loggers:
+            loggers["mlflow"].finish()
+        if "trackio" in loggers:
+            loggers["trackio"].finish()
+        if "file" in loggers:
+            loggers["file"].finish()
+        if "rl_insight" in loggers:
+            loggers["rl_insight"].finish()
+
     def __del__(self):
-        if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
-        if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
-        if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
-        if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
-        if "clearml" in self.logger:
-            self.logger["clearml"].finish()
-        if "trackio" in self.logger:
-            self.logger["trackio"].finish()
-        if "file" in self.logger:
-            self.logger["file"].finish()
+        self.finish()
+
+
+class RLInsightLogger:
+    """Logger backend that exports scalar metrics and rl-insight runtime signals."""
+
+    ENABLE_ENV = "VERL_RL_INSIGHT_ENABLE"
+    MINIMUM_RL_INSIGHT_VERSION = Version("0.3.0")
+    _init_done = False
+    _rl_insight_module = None
+    _registered_metrics: set[tuple[str | None, tuple[str, ...], str | None]] = set()
+    _warned_unsupported_features: set[str] = set()
+
+    def __init__(self, project_name, experiment_name, config=None):
+        self.init(project_name=project_name, experiment_name=experiment_name, config=config)
+
+    @classmethod
+    def _get_rl_insight(cls):
+        if cls._rl_insight_module is None:
+            import rl_insight
+
+            cls._rl_insight_module = rl_insight
+        return cls._rl_insight_module
+
+    @classmethod
+    def enabled(cls) -> bool:
+        """Return whether rl-insight is globally enabled in this process."""
+        return os.getenv(cls.ENABLE_ENV) == "1"
+
+    @classmethod
+    def _warn_unsupported_rl_insight(cls, feature: str) -> None:
+        """Warn once when an optional RL-Insight feature is unavailable."""
+        if feature in cls._warned_unsupported_features:
+            return
+        cls._warned_unsupported_features.add(feature)
+        logger.warning(
+            "RL-Insight does not support %s (requires >= %s); monitoring is disabled for this feature",
+            feature,
+            cls.MINIMUM_RL_INSIGHT_VERSION,
+        )
+
+    @classmethod
+    def _rl_insight_version(cls) -> Version:
+        module = cls._get_rl_insight()
+        return Version(getattr(module, "__version__", "0"))
+
+    @classmethod
+    def init(cls, project_name=None, experiment_name=None, config=None):
+        if not cls.enabled() or cls._init_done:
+            return
+
+        rl_insight_config = {}
+        if config is not None:
+            try:
+                rl_insight_config = config.get("trainer", {}).get("rl_insight", {}) or {}
+            except (AttributeError, KeyError, TypeError):
+                pass
+        cls._get_rl_insight().init(project=project_name, experiment_name=experiment_name, config=rl_insight_config)
+        cls._init_done = True
+        if config is not None:
+            cls.register_transfer_queue_metrics(config)
+
+    @classmethod
+    def log(cls, data, step):
+        if not cls.enabled():
+            return
+        cls._ensure_rl_insight_init()
+        module = cls._get_rl_insight()
+        # Present on current main, but not in the released 0.3.0 package.
+        metric_log = getattr(module, "metric_log", None)
+        if not callable(metric_log):
+            metric_log = None
+
+        for key, value in data.items():
+            try:
+                scalar = float(value)
+            except (TypeError, ValueError):
+                continue
+            if metric_log is not None:
+                metric_log(str(key), scalar, step=int(step))
+            else:
+                module.metric_gauge(str(key).replace("/", "_"), scalar)
+
+    @classmethod
+    def finish(cls):
+        if not cls._init_done:
+            return
+
+        cls._get_rl_insight().finish()
+        cls._init_done = False
+        cls._registered_metrics.clear()
+
+    @classmethod
+    @contextmanager
+    def trace_state(
+        cls,
+        state_name: str,
+        *,
+        state_lane_id: str | int | None = None,
+        **labels: Any,
+    ):
+        if not cls.enabled():
+            yield
+            return
+
+        cls._ensure_rl_insight_init()
+        with cls._get_rl_insight().trace_state(state_name, state_lane_id=state_lane_id, **labels):
+            yield
+
+    @classmethod
+    def trace_state_decorator(
+        cls,
+        state_name: str,
+        *,
+        state_lane_id: str | int | Callable[[Any], str | int | None] | None = None,
+    ):
+        """Decorate an async instance method with an RL-Insight state trace."""
+
+        def decorator(method):
+            if not inspect.iscoroutinefunction(method):
+                raise TypeError("trace_state_decorator can only decorate async methods")
+
+            @wraps(method)
+            async def wrapped(self, *args, **kwargs):
+                if not cls.enabled():
+                    return await method(self, *args, **kwargs)
+
+                lane_id = state_lane_id(self) if callable(state_lane_id) else state_lane_id
+                with cls.trace_state(state_name, state_lane_id=lane_id):
+                    return await method(self, *args, **kwargs)
+
+            return wrapped
+
+        return decorator
+
+    @classmethod
+    def trace_span(
+        cls,
+        name: str,
+        *,
+        start_time_ns: int,
+        end_time_ns: int,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Report one completed span through rl-insight's direct trace API."""
+        if not cls.enabled():
+            return
+
+        module = cls._get_rl_insight()
+        if cls._rl_insight_version() < cls.MINIMUM_RL_INSIGHT_VERSION or not callable(
+            getattr(module, "trace_span", None)
+        ):
+            cls._warn_unsupported_rl_insight("trace_span")
+            return
+        cls._ensure_rl_insight_init()
+        cls._get_rl_insight().trace_span(
+            name=name,
+            start_time_ns=start_time_ns,
+            end_time_ns=end_time_ns,
+            attributes=dict(attributes or {}),
+        )
+
+    @classmethod
+    def _ensure_rl_insight_init(cls) -> None:
+        if not cls._init_done:
+            cls._get_rl_insight().init()
+            cls._init_done = True
+
+    @classmethod
+    def agent_loop_session(
+        cls,
+        *,
+        experiment_name: Any | None = None,
+        sample: Any,
+        session: Any,
+        traj: Any = 0,
+        uid: Any = None,
+        global_steps: Any = None,
+        session_id: Any = None,
+    ):
+        """Return the shared agent-loop session trace state."""
+        from verl.utils.rollout_trace import RolloutTraceConfig
+
+        rollout_config = RolloutTraceConfig.get_instance()
+        project_name = rollout_config.project_name
+        if experiment_name is None:
+            experiment_name = rollout_config.experiment_name or "default"
+
+        def fallback_session():
+            return SimpleNamespace(
+                identity={
+                    "project": project_name or "default",
+                    "experiment_name": experiment_name,
+                    "sample": str(sample),
+                    "session": str(session),
+                    "traj": str(traj),
+                    "state_lane_id": f"experiment={experiment_name}/sample={sample}/session={session}/traj={traj}",
+                    "uid": uid or "",
+                    "global_steps": global_steps if global_steps is not None else "",
+                    "session_id": session_id or "",
+                },
+                finish=lambda **kwargs: None,
+            )
+
+        if cls.enabled() and cls._rl_insight_version() < cls.MINIMUM_RL_INSIGHT_VERSION:
+            cls._warn_unsupported_rl_insight("agent_loop_session")
+            return fallback_session()
+        if cls.enabled() and not cls._init_done:
+            cls.init(project_name=project_name, experiment_name=experiment_name)
+
+        try:
+            from rl_insight.agent_loop import agent_loop_session
+        except ImportError:
+            cls._warn_unsupported_rl_insight("agent_loop_session")
+            return fallback_session()
+
+        return agent_loop_session(
+            project=project_name,
+            experiment_name=experiment_name,
+            sample=sample,
+            session=session,
+            traj=traj,
+            uid=uid,
+            global_steps=global_steps,
+            session_id=session_id,
+        )
+
+    @classmethod
+    def register_rollout_metrics(
+        cls,
+        server_addresses: list[str],
+        rollout_name: str | None,
+        labels: list[dict[str, Any] | None] | None = None,
+    ) -> None:
+        cls.register_metrics(server_addresses, rollout_name, labels)
+
+    @classmethod
+    def register_transfer_queue_metrics(cls, config) -> None:
+        if not (config or {}).get("transfer_queue", {}).get("metrics", {}).get("enabled", False):
+            return
+
+        try:
+            import transfer_queue as tq
+
+            endpoint = tq.get_metrics_endpoint()
+        except Exception:
+            logger.exception("[rl-insight] Failed to get transfer_queue metrics endpoint")
+            return
+
+        if endpoint:
+            cls.register_metrics([endpoint], "transfer_queue", None)
+
+    @classmethod
+    def register_metrics(
+        cls,
+        server_addresses: list[str],
+        job_name: str | None = None,
+        labels: list[dict[str, Any] | None] | None = None,
+    ) -> None:
+        if not cls.enabled():
+            return
+
+        metric_key = (job_name, tuple(server_addresses), repr(labels))
+        if metric_key in cls._registered_metrics:
+            return
+
+        try:
+            cls._get_rl_insight().update_prometheus_config(server_addresses, job_name, labels)
+            cls._registered_metrics.add(metric_key)
+        except Exception:
+            logger.exception("[rl-insight] Failed to register metrics endpoint")
 
 
 class ClearMLLogger:
@@ -231,6 +546,20 @@ class ClearMLLogger:
         self._task.close()
 
 
+class _TrackioLoggingAdapter:
+    def __init__(self, trackio):
+        self.trackio = trackio
+
+    def log(self, data, step):
+        self.trackio.log(data, step=step)
+
+    def finish(self):
+        from trackio import context_vars
+
+        if context_vars.current_run.get() is not None:
+            self.trackio.finish()
+
+
 class FileLogger:
     def __init__(self, project_name: str, experiment_name: str):
         self.project_name = project_name
@@ -242,12 +571,12 @@ class FileLogger:
             directory = os.path.join(root_path, self.project_name)
             os.makedirs(directory, exist_ok=True)
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
-            print(f"Creating file logger at {self.filepath}")
-        self.fp = open(self.filepath, "w")
+        print(f"Creating file logger at {os.path.abspath(self.filepath)}")
+        self.fp = open(self.filepath, "wb", buffering=0)
 
     def log(self, data, step):
         data = {"step": step, "data": data}
-        self.fp.write(json.dumps(data) + "\n")
+        self.fp.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY) + b"\n")
 
     def finish(self):
         self.fp.close()
@@ -278,6 +607,8 @@ class _MlflowLoggingAdapter:
         import re
 
         self.logger = logging.getLogger(__name__)
+        # Suppress noisy "Found credentials from IAM Role" on every MLflow request
+        logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
         # MLflow metric key validation logic:
         # https://github.com/mlflow/mlflow/blob/master/mlflow/utils/validation.py#L157C12-L157C44
         # Only characters allowed: slashes, alphanumerics, underscores, periods, dashes, colons,
@@ -286,25 +617,46 @@ class _MlflowLoggingAdapter:
             r"[^/\w.\- :]"
         )  # Allowed: slashes, alphanumerics, underscores, periods, dashes, colons, and spaces.
         self._consecutive_slashes_pattern = re.compile(r"/+")
+        self._sanitized_key_cache = {}
+
+    def _sanitize_key(self, key):
+        if key in self._sanitized_key_cache:
+            return self._sanitized_key_cache[key] or key
+        # First replace @ with _at_ for backward compatibility
+        sanitized = key.replace("@", "_at_")
+        # Replace consecutive slashes with a single slash (MLflow treats them as file paths)
+        sanitized = self._consecutive_slashes_pattern.sub("/", sanitized)
+        # Then replace any other invalid characters with _
+        sanitized = self._invalid_chars_pattern.sub("_", sanitized)
+        if sanitized == key:
+            self._sanitized_key_cache[key] = None
+        else:
+            self.logger.warning("[MLflow] Metric key '%s' sanitized to '%s' due to invalid characters.", key, sanitized)
+            self._sanitized_key_cache[key] = sanitized
+        return sanitized
 
     def log(self, data, step):
         import mlflow
 
-        def sanitize_key(key):
-            # First replace @ with _at_ for backward compatibility
-            sanitized = key.replace("@", "_at_")
-            # Replace consecutive slashes with a single slash (MLflow treats them as file paths)
-            sanitized = self._consecutive_slashes_pattern.sub("/", sanitized)
-            # Then replace any other invalid characters with _
-            sanitized = self._invalid_chars_pattern.sub("_", sanitized)
-            if sanitized != key:
-                self.logger.warning(
-                    "[MLflow] Metric key '%s' sanitized to '%s' due to invalid characters.", key, sanitized
-                )
-            return sanitized
+        results = {self._sanitize_key(k): v for k, v in data.items()}
+        for _attempt in range(MLFLOW_MAX_ATTEMPTS):
+            try:
+                mlflow.log_metrics(metrics=results, step=step)
+                return
+            except Exception as error:
+                # No sleep between retries — this runs per training step, so we avoid blocking.
+                msg = "mlflow.log_metrics failed (attempt %d/%d): %s"
+                args = (_attempt + 1, MLFLOW_MAX_ATTEMPTS, error)
+                if _attempt < MLFLOW_MAX_ATTEMPTS - 1:
+                    self.logger.info(msg, *args)
+                else:
+                    self.logger.warning(msg, *args)
 
-        results = {sanitize_key(k): v for k, v in data.items()}
-        mlflow.log_metrics(metrics=results, step=step)
+    def finish(self):
+        import mlflow
+
+        if mlflow.active_run() is not None:
+            mlflow.end_run()
 
 
 def _compute_mlflow_params_from_objects(params) -> dict[str, Any]:
@@ -354,6 +706,8 @@ class ValidationGenerationsLogger:
             self.log_generations_to_swanlab(samples, step)
         if "mlflow" in loggers:
             self.log_generations_to_mlflow(samples, step)
+        if "trackio" in loggers:
+            self.log_generations_to_trackio(samples, step)
 
         if "clearml" in loggers:
             self.log_generations_to_clearml(samples, step)
@@ -421,7 +775,6 @@ class ValidationGenerationsLogger:
         """Log validation generation to mlflow as artifacts"""
         # https://mlflow.org/docs/latest/api_reference/python_api/mlflow.html?highlight=log_artifact#mlflow.log_artifact
 
-        import json
         import tempfile
 
         import mlflow
@@ -438,6 +791,34 @@ class ValidationGenerationsLogger:
                 mlflow.log_artifact(validation_gen_step_file)
         except Exception as e:
             print(f"WARNING: save validation generation file to mlflow failed with error {e}")
+
+    def log_generations_to_trackio(self, samples, step):
+        """Log validation generations to trackio as traces."""
+        import trackio
+
+        traces = []
+        for sample_index, sample in enumerate(samples):
+            if len(sample) >= 3:
+                input_text, output_text, score = sample[0], sample[1], sample[2]
+            else:
+                input_text, output_text, score = sample, "", None
+
+            traces.append(
+                trackio.Trace(
+                    messages=[
+                        {"role": "user", "content": str(input_text)},
+                        {"role": "assistant", "content": str(output_text)},
+                    ],
+                    metadata={
+                        "source": "validation_generations",
+                        "sample_index": sample_index,
+                        "score": score,
+                    },
+                )
+            )
+
+        if traces:
+            trackio.log({"val/generations": traces}, step=step)
 
     def log_generations_to_clearml(self, samples, step):
         """Log validation generation to clearml as table"""
@@ -506,3 +887,53 @@ class ValidationGenerationsLogger:
         self.writer.add_text("val/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
+
+@dataclasses.dataclass
+class DapoFilteredRewardTableLogger:
+    """Wandb table of DAPO-filtered (no-signal) group counts per reward value.
+
+    Each training step adds one row containing compact ``reward:count`` pairs. Wandb 0.20+
+    uploads rows incrementally; older versions rebuild the full table for compatibility.
+
+    Intentionally wandb-only: this "value distribution over time" view is a table, which other
+    tracking backends do not render usefully. Non-wandb backends are silently skipped.
+    """
+
+    project_name: str = None
+    experiment_name: str = None
+
+    def log(self, loggers, reward_counts: dict, step: int):
+        """reward_counts maps metric value -> count for this step (already merged across mini-batches)."""
+        if "wandb" in loggers:
+            self._log_to_wandb(reward_counts, step)
+
+    def _log_to_wandb(self, reward_counts: dict, step: int):
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        row = {float(value): int(count) for value, count in reward_counts.items()}
+        counts_text = ", ".join(f"{value:g}:{row[value]}" for value in sorted(row))
+        columns = ["step", "reward_counts"]
+
+        if not hasattr(self, "_use_incremental_table"):
+            self._use_incremental_table = Version(wandb.__version__) >= Version("0.20.0")
+            if self._use_incremental_table:
+                self._table = wandb.Table(columns=columns, log_mode="INCREMENTAL")
+            else:
+                self._rows = []
+                logger.warning(
+                    "wandb<0.20.0 does not support incremental tables; "
+                    "the DAPO filtered-reward table will re-upload its full history each step."
+                )
+
+        if self._use_incremental_table:
+            self._table.add_data(step, counts_text)
+            table = self._table
+        else:
+            self._rows.append([step, counts_text])
+            table = wandb.Table(columns=columns, data=list(self._rows))
+
+        wandb.log({"training/filter_groups/filtered_reward_counts": table}, step=step)
