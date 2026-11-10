@@ -71,5 +71,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=-1 \
     trainer.val_before_train=False \
     trainer.resume_mode=disable \
-    trainer.total_training_steps=600 \
+    trainer.total_training_steps=${TOTAL_STEPS:-600} \
     trainer.total_epochs=1 "$@"
