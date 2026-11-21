@@ -135,6 +135,24 @@ included in the repo.
 Full RHDA detection on the paper runs requires the external mirror release
 (see `detection/docs/RESTORE_DATA.md`) and external API credentials.
 
+To use the optional m02 system prompt, set
+`RHDA_SYSTEM_PROMPT_FILE=detection/rhda/m02_prompt.txt` when launching RHDA
+from the repository root. Leave it unset for the original prompt.
+
+### Tool output and context length
+
+We developed the first RHDA agent with Qwen-Flash. In long tool results it
+sometimes missed evidence in the middle, so we limited tool output to about
+8K characters. In later runs with stronger agents, we observed more accurate
+onset judgments when the agent could inspect the full evidence.
+
+By default, RHDA now passes the full tool result to the agent. Set
+`--max-tool-output-chars 8192` for an 8K-character budget, or choose a
+different positive value for your model. The limit applies to each tool
+message, including its truncation marker. Zero disables the limit. The
+agent can still select a subset of cases or request a file prefix.
+Each run records the setting in `agent_workspace/run_config.json`.
+
 ## 6. Minimal live examples
 
 - RHDA run_a example: `detection/agent_compare/rhda_results/run_a/`

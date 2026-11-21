@@ -29,6 +29,7 @@ from typing import Any
 
 from detection.rhda.prompts import (  # noqa: F401
     SYSTEM_PROMPT,
+    SYSTEM_PROMPT_FILE,
     initial_user_message,
     resume_user_message,
 )
@@ -121,6 +122,7 @@ class AgenticDetector:
         max_loop_iterations: int = 60,
         temperature: float = 0.1,
         workspace_name: str = "agent_workspace",
+        max_tool_output_chars: int = 0,
     ):
         if not rollout_dirs:
             raise ValueError("rollout_dirs must be a non-empty list")
@@ -128,6 +130,9 @@ class AgenticDetector:
         self.api_url = api_url
         self.api_key = api_key
         self.model = api_model or os.getenv("AGENT_MODEL", "qwen-max")
+        if max_tool_output_chars < 0:
+            raise ValueError("max_tool_output_chars must be nonnegative")
+        self.max_tool_output_chars = max_tool_output_chars
         self.poll_sec = poll_sec
         self.max_tool_calls = max(0, int(max_tool_calls))
         self.max_loop_iterations = max_loop_iterations
@@ -255,11 +260,13 @@ class AgenticDetector:
             "mode": "online" if online else "offline",
             "model": self.model,
             "api_url": self.api_url or os.getenv("AGENT_API_URL", ""),
-            "prompt_version": prompt_version,
+            "prompt_version": "external" if SYSTEM_PROMPT_FILE else prompt_version,
+            "system_prompt_file": SYSTEM_PROMPT_FILE,
             "prompt_version_env_raw": prompt_version_raw,
             "prompt_module": prompt_module,
             "temperature": self.temperature,
             "max_tool_calls": self.max_tool_calls,
+            "max_tool_output_chars": self.max_tool_output_chars,
             "max_loop_iterations": self.max_loop_iterations,
             "rollout_dirs": list(self.rollout_dirs),
             "output_dir": str(self.output_dir),
@@ -445,6 +452,10 @@ class AgenticDetector:
                     if name not in control_tools:
                         tool_calls_used += 1
 
+                limit = self.max_tool_output_chars
+                if limit and len(obs) > limit:
+                    marker = "…[truncated]"[:limit]
+                    obs = obs[:limit - len(marker)] + marker
                 tool_msg = {
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),

@@ -17,7 +17,7 @@ from detection.rhda.common.response_features import strip_think
 def sample_cases(
     entries: list[dict],
     n: int = 15,
-    response_max_chars: int = 1500,
+    response_max_chars: int | None = None,
     seed: int | None = None,
     rubrics_map: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
@@ -71,7 +71,7 @@ def sample_cases(
     def _fmt(e: dict, bucket_label: str) -> dict[str, str]:
         response = strip_think(e.get("output", ""))
         case = {
-            "prompt": (e.get("input") or "").strip()[:500],
+            "prompt": (e.get("input") or "").strip(),
             "response": response[:response_max_chars],
             "score": f"{float(e.get('score', 0) or 0):.4f}",
             "bucket": bucket_label,

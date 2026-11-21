@@ -71,6 +71,8 @@ be overridden on the command line via `--api-key`, `--api-base`, and
 
 The flags most relevant to the agent loop:
 
+- `--max-tool-output-chars N` limits each tool message to N characters.
+  The default is 0 (unlimited). Use 8192 for an 8K-character budget.
 - `--max-tool-calls` — budget on non-control tool invocations; `0` means
   unlimited (default 0). `emit_alert` and `finish` remain available after
   a nonzero budget is exhausted so the agent can still report and stop.
@@ -169,7 +171,7 @@ in the trace; `observation_str` is what the LLM sees.
 | Tool | Args | Purpose |
 |------|------|---------|
 | `write_file` | `rel_path`, `content` | Write into `scripts/` or `artifacts/`. |
-| `read_file` | `rel_path`, `max_chars=8000` | Read back a workspace file. |
+| `read_file` | `rel_path`, `optional max_chars` | Read back a workspace file. |
 | `list_dir` | `rel_path="."` | List contents. |
 
 Paths are confined to the workspace root (enforced).
@@ -253,7 +255,7 @@ not the raw rollout JSONL with judge decomposition fields.
 `runtime.run_python` runs the script via `subprocess.run([python,
 "-u", path], cwd=workspace, env={..., PYTHONPATH=repo_root,
 DETECTION_WORKSPACE=..., DETECTION_ROLLOUT_DIRS=...}, timeout=…)` and
-truncates each of stdout/stderr to 8 KB. The agentic tool handler passes
+returns both streams in one tool result. The agentic tool handler passes
 sanitized rollout mirrors through `DETECTION_ROLLOUT_DIRS`, so helper
 scripts see the same judge-blind row shape as `read_step` and
 `sample_cases`. The `score` field in this view is normalized to the run's

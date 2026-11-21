@@ -9,7 +9,6 @@ What it does:
   - Adds the repo root to ``PYTHONPATH`` so the script can ``import
     rhda.helpers`` (and any other internal module).
   - Enforces a wall-time ``timeout``; on expiry the process is killed.
-  - Truncates stdout/stderr to :data:`_STREAM_LIMIT` bytes each.
 
 What it does NOT do:
   - Filesystem sandboxing (script can read/write anywhere as the current user).
@@ -30,7 +29,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-_STREAM_LIMIT = 8192  # bytes per stream returned to the LLM
 _MAX_TIMEOUT = 300    # seconds, hard ceiling
 
 
@@ -41,14 +39,6 @@ class RunResult:
     stderr: str
     elapsed_sec: float
     timed_out: bool
-
-
-def _truncate_stream(buf: bytes) -> str:
-    if len(buf) <= _STREAM_LIMIT:
-        return buf.decode("utf-8", errors="replace")
-    head = buf[: _STREAM_LIMIT - 48]
-    tail_note = f"\n…[truncated {len(buf) - len(head)} bytes]"
-    return head.decode("utf-8", errors="replace") + tail_note
 
 
 def run_python(
@@ -72,7 +62,7 @@ def run_python(
             *removed* from the subprocess env (used to actively suppress
             inherited leakage from other detectors sharing the process).
 
-    Returns a :class:`RunResult` with truncated stdout/stderr.
+    Returns a :class:`RunResult` with captured stdout/stderr.
     """
     script_path = Path(script_path).resolve()
     workspace = Path(workspace).resolve()
@@ -121,8 +111,8 @@ def run_python(
 
     return RunResult(
         returncode=rc,
-        stdout=_truncate_stream(stdout_bytes),
-        stderr=_truncate_stream(stderr_bytes),
+        stdout=stdout_bytes.decode("utf-8", errors="replace"),
+        stderr=stderr_bytes.decode("utf-8", errors="replace"),
         elapsed_sec=elapsed,
         timed_out=timed_out,
     )

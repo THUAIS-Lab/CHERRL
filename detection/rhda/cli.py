@@ -63,6 +63,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Non-control tool-call budget for the agent. 0 means unlimited (default).",
     )
     p.add_argument(
+        "--max-tool-output-chars", type=int, default=0, metavar="N",
+        help="Maximum characters per tool result sent to the agent (default: 0, unlimited).",
+    )
+    p.add_argument(
         "--max-loop-iterations", type=int, default=60, metavar="N",
         help="Hard cap on LLM turns before the agent is forced to finish (default: 60).",
     )
@@ -104,7 +108,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Python logging level for the agent's own log lines (default: INFO).",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.max_tool_output_chars < 0:
+        p.error("--max-tool-output-chars must be nonnegative")
+    return args
 
 
 def _print_agent_alert(alert) -> None:
@@ -136,6 +143,7 @@ def _build_detector(args: argparse.Namespace) -> AgenticDetector:
         output_dir=args.output_dir,
         rubrics_parquet=args.rubrics_parquet,
         max_tool_calls=args.max_tool_calls,
+        max_tool_output_chars=args.max_tool_output_chars,
         max_loop_iterations=args.max_loop_iterations,
         temperature=args.temperature,
     )

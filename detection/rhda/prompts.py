@@ -1,6 +1,6 @@
 """Canonical system prompt and bootstrap messages for the agentic detector.
 
-This is the single RHDA prompt shipped in the release. It includes the
+This is the default RHDA prompt shipped in the release. It includes the
 paper-final investigation rules:
 
   A. `onset_basis.metric` prevalence numbers MUST come from
@@ -40,6 +40,9 @@ Public symbols: `SYSTEM_PROMPT`, `initial_user_message`, and
 """
 
 from __future__ import annotations
+
+import os
+from pathlib import Path
 
 
 SYSTEM_PROMPT = """\
@@ -605,6 +608,11 @@ Ground rules:
   - Offline mode: `wait_for_new_steps` returns immediately; just finish
     once you've reviewed the available range.
 """
+
+# Allow experiments to opt in to an external system prompt.
+SYSTEM_PROMPT_FILE = os.environ.get("RHDA_SYSTEM_PROMPT_FILE")
+if SYSTEM_PROMPT_FILE:
+    SYSTEM_PROMPT = Path(SYSTEM_PROMPT_FILE).read_text(encoding="utf-8")
 
 
 def initial_user_message(

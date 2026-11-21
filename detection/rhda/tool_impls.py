@@ -42,23 +42,8 @@ from detection.rhda.common.response_features import strip_think
 
 logger = logging.getLogger(__name__)
 
-# Safety limits on what we echo back to the LLM.
-_MAX_OBS_CHARS = 8192
-_MAX_RESPONSE_SNIPPET = 2000
-
-
-def _trim_observation(text: str, limit: int = _MAX_OBS_CHARS) -> str:
-    if len(text) <= limit:
-        return text
-    head = text[: limit - 50]
-    return head + f"\n…[truncated {len(text) - len(head)} chars]"
-
-
-def _fmt_json_for_llm(obj: Any, limit: int = _MAX_OBS_CHARS) -> str:
-    return _trim_observation(
-        json.dumps(obj, ensure_ascii=False, indent=2, default=str),
-        limit=limit,
-    )
+def _fmt_json_for_llm(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
 
 
 def _scan_step_files(rollout_dirs: list[str]) -> list[tuple[int, Path]]:
@@ -249,8 +234,8 @@ def _h_read_step(ctx, step: int, limit: int | None = None, **_kwargs) -> tuple[s
         preview = []
         for e in entries[:limit]:
             preview.append({
-                "input": (e.get("input") or "")[:400],
-                "output": strip_think(e.get("output") or "")[:_MAX_RESPONSE_SNIPPET],
+                "input": e.get("input") or "",
+                "output": strip_think(e.get("output") or ""),
                 "score": float(e.get("score", 0) or 0),
             })
         summary["preview"] = preview
@@ -399,7 +384,7 @@ def _h_surface_stats(
             "Pass baseline_step=<earlier step> or call again on a later step.",
             True,
         )
-    return _trim_observation(text), True
+    return text, True
 
 
 def _h_cka(ctx, step: int, **_kwargs) -> tuple[str, bool]:
@@ -485,7 +470,7 @@ def _h_rejudge(
         )
     except Exception as exc:
         return f"[error] rejudge LLM call failed: {exc}", False
-    return _trim_observation(raw.strip(), limit=2048), True
+    return raw.strip(), True
 
 
 # ---------------------------------------------------------------------------
@@ -529,13 +514,15 @@ def _h_write_file(
 
 
 def _h_read_file(
-    ctx, rel_path: str, max_chars: int = 8000, **_kwargs
+    ctx, rel_path: str, max_chars: int | None = None, **_kwargs
 ) -> tuple[str, bool]:
     path = _resolve_ws_path(ctx, rel_path)
     if not path.exists():
         return f"[error] no such file in workspace: {rel_path}", False
     data = path.read_text(encoding="utf-8")
-    return _trim_observation(data, limit=int(max_chars)), True
+    if max_chars is not None and max_chars < 0:
+        raise ValueError("max_chars must be nonnegative")
+    return data[:max_chars], True
 
 
 def _h_list_dir(
@@ -649,7 +636,7 @@ def _h_run_python(
     if stderr:
         parts.append(f"--- stderr ---\n{stderr}")
     ok = result.returncode == 0 and not result.timed_out
-    return _trim_observation("\n".join(parts)), ok
+    return "\n".join(parts), ok
 
 
 # ---------------------------------------------------------------------------
@@ -1210,8 +1197,7 @@ def build_tool_specs() -> list[ToolSpec]:
                 {
                     "rel_path": str_field("Path relative to workspace."),
                     "max_chars": int_field(
-                        "Truncate output to this many characters "
-                        "(default 8000).", default=8000),
+                        "Read at most this many characters (default: whole file)."),
                 },
                 required=["rel_path"],
             ),
@@ -1235,7 +1221,7 @@ def build_tool_specs() -> list[ToolSpec]:
             name="run_python",
             description=(
                 "Run a .py file from inside the workspace in a subprocess. "
-                "stdout+stderr are returned (truncated). Scripts may import "
+                "stdout+stderr are returned. Scripts may import "
                 "rhda.helpers to get load_step / sample_high / "
                 "sample_low / rejudge / log_metric primitives. "
                 "Isolation is crash/timeout only, not a security sandbox."
